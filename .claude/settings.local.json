@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.mql5.com)",
+      "WebFetch(domain:github.com)",
+      "Read(//e/FOREX/DailyBreakout/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
