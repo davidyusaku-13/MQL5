@@ -75,6 +75,15 @@ enum EXECUTION_TYPE
    EXEC_PENDING = 1
 };
 
+//--- Trade Group Structure for Auto-Breakeven
+struct TradeGroup
+{
+   ulong ticket_tp1;          // Ticket for trade with TP1
+   ulong ticket_tp2;          // Ticket for trade with TP2
+   double entry_price;        // Average entry price for BE
+   bool be_moved;             // Has BE already been applied?
+   datetime created_time;     // When group was created
+};
 
 //--- Global variables
 CTrade trade;
@@ -96,6 +105,20 @@ double symbol_min_lot;
 double symbol_max_lot;
 double symbol_lot_step;
 int symbol_stops_level;
+
+TradeGroup active_groups[];   // Array of active trade groups
+int active_group_count = 0;   // Number of active groups
+
+// Track pending orders waiting to be filled (for BE group creation)
+struct PendingPair
+{
+   ulong order1;
+   ulong order2;
+   double open_price;
+   datetime created;
+};
+PendingPair pending_pairs[];
+int pending_pair_count = 0;
 
 //+------------------------------------------------------------------+
 //| Multi-Trade Manager Dialog Class                                 |
@@ -857,6 +880,10 @@ void CMultiTradeDialog::ExecuteMarketTrades(int num_trades, double lot_size, dou
    int successful_trades = 0;
    string risk_type = m_half_risk_enabled ? " (Half Risk)" : " (Normal Risk)";
 
+   // Track tickets and entries for BE group creation
+   ulong tickets[2];
+   double entries[2];
+
    for(int i = 0; i < num_trades; i++)
    {
       // Get TP for this trade using improved logic
@@ -888,14 +915,34 @@ void CMultiTradeDialog::ExecuteMarketTrades(int num_trades, double lot_size, dou
       {
          successful_trades++;
          ulong ticket = trade.ResultOrder();
-         Print("Market trade ", i + 1, " executed successfully. Ticket: ", ticket,
-               " TP: ", tp_for_trade, " Lots: ", lot_size, risk_type);
+
+         // Get position entry price for BE tracking
+         if(PositionSelectByTicket(ticket))
+         {
+            double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            tickets[i] = ticket;
+            entries[i] = entry_price;
+
+            Print("Market trade ", i + 1, " executed successfully. Ticket: ", ticket,
+                  " Entry: ", entry_price, " TP: ", tp_for_trade, " Lots: ", lot_size, risk_type);
+         }
+         else
+         {
+            Print("[WARNING] Could not retrieve entry price for ticket ", ticket);
+         }
       }
       else
       {
          Print("[ERROR] Market trade ", i + 1, " failed after ", max_attempts + 1, " attempts. Ret=",
                trade.ResultRetcode(), " Desc=", trade.ResultRetcodeDescription());
       }
+   }
+
+   // Create BE group if both trades succeeded
+   if(successful_trades == 2)
+   {
+      double avg_entry = (entries[0] + entries[1]) / 2.0;
+      CreateTradeGroup(tickets[0], tickets[1], avg_entry);
    }
 
    //--- Update status
@@ -921,6 +968,8 @@ void CMultiTradeDialog::ExecutePendingTrades(int num_trades, double lot_size, do
       order_type = (open_price < current_bid) ? ORDER_TYPE_SELL_STOP : ORDER_TYPE_SELL_LIMIT;
 
    int successful = 0;
+   ulong order_tickets[2];
+
    for(int i = 0; i < num_trades; i++)
    {
       // Get TP for this trade using improved logic
@@ -949,6 +998,8 @@ void CMultiTradeDialog::ExecutePendingTrades(int num_trades, double lot_size, do
       {
          successful++;
          ulong order_ticket = trade.ResultOrder();
+         order_tickets[i] = order_ticket;
+
          Print("Pending order ", i + 1, " placed successfully. Ticket: ", order_ticket,
                " Entry: ", open_price, " TP: ", tp_for_trade, " Lots: ", lot_size, risk_type);
       }
@@ -956,6 +1007,22 @@ void CMultiTradeDialog::ExecutePendingTrades(int num_trades, double lot_size, do
       {
          Print("[ERROR] Pending order ", i + 1, " failed after ", max_attempts + 1, " attempts. Ret=",
                trade.ResultRetcode(), " Desc=", trade.ResultRetcodeDescription());
+      }
+   }
+
+   // Track pending pair for BE group creation when filled
+   if(successful == 2)
+   {
+      int new_size = pending_pair_count + 1;
+      if(ArrayResize(pending_pairs, new_size) >= 0)
+      {
+         pending_pairs[pending_pair_count].order1 = order_tickets[0];
+         pending_pairs[pending_pair_count].order2 = order_tickets[1];
+         pending_pairs[pending_pair_count].open_price = open_price;
+         pending_pairs[pending_pair_count].created = TimeCurrent();
+         pending_pair_count++;
+
+         Print("[BE] Pending pair tracked for BE group creation: ", order_tickets[0], " & ", order_tickets[1]);
       }
    }
 
@@ -1011,6 +1078,97 @@ void InitializeSymbolData()
    current_ask = SymbolInfoDouble(current_symbol, SYMBOL_ASK);
    last_bid = current_bid;
    last_ask = current_ask;
+}
+
+//+------------------------------------------------------------------+
+//| Auto-Breakeven Helper Functions                                  |
+//+------------------------------------------------------------------+
+int FindGroupByTicket(ulong ticket)
+{
+   for(int i = 0; i < active_group_count; i++)
+   {
+      if(active_groups[i].ticket_tp1 == ticket || active_groups[i].ticket_tp2 == ticket)
+         return i;
+   }
+   return -1; // Not found
+}
+
+void CreateTradeGroup(ulong ticket1, ulong ticket2, double avg_entry)
+{
+   // Resize array
+   int new_size = active_group_count + 1;
+   if(ArrayResize(active_groups, new_size) < 0)
+   {
+      Print("[ERROR] Failed to resize active_groups array");
+      return;
+   }
+
+   // Create new group
+   active_groups[active_group_count].ticket_tp1 = ticket1;
+   active_groups[active_group_count].ticket_tp2 = ticket2;
+   active_groups[active_group_count].entry_price = avg_entry;
+   active_groups[active_group_count].be_moved = false;
+   active_groups[active_group_count].created_time = TimeCurrent();
+
+   active_group_count++;
+
+   Print("[BE] Trade group created | TP1: ", ticket1, " | TP2: ", ticket2, " | Entry: ", avg_entry);
+}
+
+bool MoveToBreakeven(ulong ticket, double be_price)
+{
+   // Select position
+   ResetLastError();
+   if(!PositionSelectByTicket(ticket))
+   {
+      Print("[ERROR] Cannot select ticket #", ticket, " for BE move. Error: ", GetLastError());
+      return false;
+   }
+
+   // Get current TP (keep it unchanged)
+   double current_tp = PositionGetDouble(POSITION_TP);
+
+   // Normalize BE price to symbol digits
+   be_price = NormalizeDouble(be_price, symbol_digits);
+
+   // Modify: Set SL to entry price, keep TP
+   ResetLastError();
+   bool result = trade.PositionModify(ticket, be_price, current_tp);
+
+   if(result)
+   {
+      Print("[BE SUCCESS] Ticket #", ticket, " moved to breakeven: ", be_price);
+   }
+   else
+   {
+      int error = GetLastError();
+      Print("[BE ERROR] Failed to move ticket #", ticket, " to BE. Error: ", error,
+            " | RetCode: ", trade.ResultRetcode(), " | Desc: ", trade.ResultRetcodeDescription());
+   }
+
+   return result;
+}
+
+void CleanupClosedGroups()
+{
+   for(int i = active_group_count - 1; i >= 0; i--)
+   {
+      bool tp1_exists = PositionSelectByTicket(active_groups[i].ticket_tp1);
+      bool tp2_exists = PositionSelectByTicket(active_groups[i].ticket_tp2);
+
+      // If both trades closed, remove group
+      if(!tp1_exists && !tp2_exists)
+      {
+         Print("[BE] Removing closed group | TP1: ", active_groups[i].ticket_tp1, " | TP2: ", active_groups[i].ticket_tp2);
+
+         // Shift array elements
+         for(int j = i; j < active_group_count - 1; j++)
+            active_groups[j] = active_groups[j + 1];
+
+         active_group_count--;
+         ArrayResize(active_groups, active_group_count);
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1157,7 +1315,145 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-   // Placeholder for future transaction handling if needed
+   // Handle pending order fills - create BE groups when both orders filled
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      ResetLastError();
+      if(!HistoryDealSelect(trans.deal))
+         return;
+
+      // Check if this is a position entry from a pending order
+      ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+      if(deal_entry != DEAL_ENTRY_IN)
+         return;  // Not a position opening
+
+      // Check if it's our order
+      ulong deal_magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+      if(deal_magic != Magic_Number)
+         return;
+
+      string deal_comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+      if(StringFind(deal_comment, Trade_Comment) < 0)
+         return;
+
+      // Get position info
+      ulong position_id = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      ulong order_id = HistoryDealGetInteger(trans.deal, DEAL_ORDER);
+
+      // Check if this order is part of a pending pair
+      for(int i = 0; i < pending_pair_count; i++)
+      {
+         if(pending_pairs[i].order1 == order_id || pending_pairs[i].order2 == order_id)
+         {
+            // Mark which order filled
+            bool is_order1 = (pending_pairs[i].order1 == order_id);
+
+            // Check if the other order was also filled
+            ulong other_order = is_order1 ? pending_pairs[i].order2 : pending_pairs[i].order1;
+
+            // Try to find position from other order
+            for(int p = PositionsTotal() - 1; p >= 0; p--)
+            {
+               ulong pos_ticket = PositionGetTicket(p);
+               if(PositionSelectByTicket(pos_ticket))
+               {
+                  ulong pos_magic = PositionGetInteger(POSITION_MAGIC);
+                  string pos_comment = PositionGetString(POSITION_COMMENT);
+
+                  if(pos_magic == Magic_Number && StringFind(pos_comment, Trade_Comment) >= 0)
+                  {
+                     // Found a matching position - check if it's from our pair
+                     // Both orders filled - create BE group
+                     double entry1 = 0, entry2 = 0;
+
+                     if(PositionSelectByTicket(position_id))
+                        entry1 = PositionGetDouble(POSITION_PRICE_OPEN);
+                     if(PositionSelectByTicket(pos_ticket))
+                        entry2 = PositionGetDouble(POSITION_PRICE_OPEN);
+
+                     if(entry1 > 0 && entry2 > 0 && position_id != pos_ticket)
+                     {
+                        double avg_entry = (entry1 + entry2) / 2.0;
+                        CreateTradeGroup(position_id, pos_ticket, avg_entry);
+
+                        // Remove from pending pairs
+                        for(int j = i; j < pending_pair_count - 1; j++)
+                           pending_pairs[j] = pending_pairs[j + 1];
+
+                        pending_pair_count--;
+                        ArrayResize(pending_pairs, pending_pair_count);
+                        break;
+                     }
+                  }
+               }
+            }
+            break;
+         }
+      }
+   }
+
+   // Handle position closures - trigger BE if profitable
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      ResetLastError();
+      if(!HistoryDealSelect(trans.deal))
+         return;
+
+      // Check if this is a position exit
+      ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+      if(deal_entry != DEAL_ENTRY_OUT)
+         return;  // Not a position closing
+
+      // Check if it's our trade
+      ulong deal_magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+      if(deal_magic != Magic_Number)
+         return;
+
+      string deal_comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+      if(StringFind(deal_comment, Trade_Comment) < 0)
+         return;
+
+      // Get position ID and profit
+      ulong position_id = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+
+      // Only trigger BE on profitable close
+      if(profit <= 0)
+      {
+         Print("[BE] Position #", position_id, " closed with loss/BE ($", DoubleToString(profit, 2), "). No BE trigger.");
+         return;
+      }
+
+      // Find the group this position belongs to
+      int group_index = FindGroupByTicket(position_id);
+      if(group_index < 0)
+         return;  // Not in any group
+
+      // Check if BE already moved
+      if(active_groups[group_index].be_moved)
+      {
+         Print("[BE] Group already moved to breakeven. Position #", position_id, " closed profitably ($", DoubleToString(profit, 2), ").");
+         return;
+      }
+
+      // Find the remaining ticket
+      ulong remaining_ticket = 0;
+      if(position_id == active_groups[group_index].ticket_tp1)
+         remaining_ticket = active_groups[group_index].ticket_tp2;
+      else if(position_id == active_groups[group_index].ticket_tp2)
+         remaining_ticket = active_groups[group_index].ticket_tp1;
+
+      if(remaining_ticket > 0)
+      {
+         Print("[BE TRIGGER] Position #", position_id, " closed profitably ($", DoubleToString(profit, 2), "). Moving remaining position #", remaining_ticket, " to BE.");
+
+         // Move remaining position to breakeven
+         if(MoveToBreakeven(remaining_ticket, active_groups[group_index].entry_price))
+         {
+            active_groups[group_index].be_moved = true;
+         }
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1174,6 +1470,10 @@ void OnTick()
    {
       total_positions = CountMyPositions();
       total_pending_orders = CountMyPendingOrders();
+
+      // Cleanup closed BE groups every ~1 second
+      CleanupClosedGroups();
+
       last_count_update = current_time;
    }
 
