@@ -12,7 +12,11 @@ CTrade trade;
 
 // Input Parameters
 input int magic_number = 12345;                        // Magic Number
-input double risk_percentage = 1.0;                    // Risk percentage per trade (% of account balance)
+input bool autolot = true;                             // Use autolot based on balance
+input double base_balance = 100.0;                     // Base balance for lot calculation
+input double lot = 0.01;                               // Lot size for each base_balance unit
+input double min_lot = 0.01;                           // Minimum lot size
+input double max_lot = 10.0;                           // Maximum lot size
 input int stop_loss = 90;                              // Stop Loss in % of the range (0=off)
 input int take_profit = 0;                             // Take Profit in % of the range (0=off)
 input int range_start_time = 90;                       // Range start time in minutes
@@ -273,51 +277,33 @@ void CalculateDailyRange()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size based on risk percentage                      |
+//| Calculate lot size based on the settings                         |
 //+------------------------------------------------------------------+
-double CalculateLotSize(double range_size, double sl_distance_price)
+double CalculateLotSize(double range_size)
 {
-   // Get account balance
-   double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if (autolot) // Autolot mode
+   {
+      double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
 
-   // Calculate the risk amount in account currency
-   double risk_amount = account_balance * (risk_percentage / 100.0);
+      // Calculate lot size proportional to account balance
+      double balance_ratio = account_balance / base_balance;
+      double lot_size = NormalizeDouble(balance_ratio * lot, 2);
 
-   // Calculate SL distance in points
-   double sl_distance_points = sl_distance_price / _Point;
+      // Apply min/max limits
+      if (lot_size < min_lot)
+         lot_size = min_lot;
+      else if (lot_size > max_lot)
+         lot_size = max_lot;
 
-   // Get contract size (lot size in base currency)
-   double contract_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+      Print("Autolot calculation - Balance: ", account_balance, ", Base balance: ", base_balance,
+            ", Balance ratio: ", balance_ratio, ", Base lot: ", lot, ", Calculated lot: ", lot_size);
 
-   // Get tick value (value of 1 point movement)
-   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-
-   // Calculate lot size based on risk
-   // Formula: Lot Size = Risk Amount / (SL in points × Tick Value)
-   double lot_size = risk_amount / (sl_distance_points * tick_value);
-
-   // Normalize to allowed lot step
-   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   lot_size = MathFloor(lot_size / lot_step) * lot_step;
-
-   // Get broker's min and max lot limits
-   double min_lot_broker = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double max_lot_broker = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-
-   // Apply broker limits (but don't apply user-defined limits as per requirements)
-   if (lot_size < min_lot_broker)
-      lot_size = min_lot_broker;
-   else if (lot_size > max_lot_broker)
-      lot_size = max_lot_broker;
-
-   Print("Risk calculation - Balance: ", account_balance,
-         ", Risk %: ", risk_percentage,
-         ", Risk Amount: ", risk_amount,
-         ", SL Distance (points): ", sl_distance_points,
-         ", Tick Value: ", tick_value,
-         ", Calculated Lot: ", lot_size);
-
-   return lot_size;
+      return lot_size;
+   }
+   else // Fixed lot size
+   {
+      return lot; // Use lot as fixed lot value
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -353,30 +339,17 @@ void PlacePendingOrders()
       return;
    }
 
+   g_lot_size = CalculateLotSize(range_size);
+
    // Calculate SL and TP
    double buy_sl = 0, buy_tp = 0, sell_sl = 0, sell_tp = 0;
-   double buy_sl_distance = 0, sell_sl_distance = 0;
 
    if (stop_loss > 0)
    {
       // Calculate SL based on range percentage
       buy_sl = g_high_price - (range_size * stop_loss / 100);
       sell_sl = g_low_price + (range_size * stop_loss / 100);
-
-      // Calculate SL distance in price for lot size calculation
-      buy_sl_distance = g_high_price - buy_sl;
-      sell_sl_distance = sell_sl - g_low_price;
    }
-   else
-   {
-      Print("Warning: stop_loss is set to 0. Risk percentage calculation requires a stop loss. No orders will be placed.");
-      g_orders_placed = true;
-      return;
-   }
-
-   // Calculate lot size based on risk percentage and SL distance
-   // Use buy SL distance (they should be the same due to symmetry)
-   g_lot_size = CalculateLotSize(range_size, buy_sl_distance);
 
    if (take_profit > 0)
    {
