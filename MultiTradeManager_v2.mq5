@@ -208,6 +208,8 @@ CMultiTradeDialog::CMultiTradeDialog(void)
 //+------------------------------------------------------------------+
 CMultiTradeDialog::~CMultiTradeDialog(void)
 {
+   // Ensure all controls are properly destroyed
+   // CAppDialog base class will handle most cleanup, but we ensure it here
 }
 
 //+------------------------------------------------------------------+
@@ -1304,8 +1306,49 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   Print("Starting deinitialization (reason: ", reason, ")");
+   
+   // Clean up dialog properly - Destroy will handle checking if it exists
+   Print("Destroying dialog...");
    g_dialog.Destroy(reason);
-   Print("MultiTradeManager EA v2.0 deinitialized");
+   
+   // Delete all chart objects with our prefix to ensure complete cleanup
+   int obj_total = ObjectsTotal(0, 0, -1);
+   Print("Total objects before cleanup: ", obj_total);
+   
+   for(int i = obj_total - 1; i >= 0; i--)
+   {
+      string obj_name = ObjectName(0, i, 0, -1);
+      // Delete objects that start with our dialog name or any control names
+      if(StringFind(obj_name, "MultiTradeManager") >= 0 ||
+         StringFind(obj_name, "btn_") >= 0 ||
+         StringFind(obj_name, "edit_") >= 0 ||
+         StringFind(obj_name, "label_") >= 0)
+      {
+         Print("Deleting object: ", obj_name);
+         ObjectDelete(0, obj_name);
+      }
+   }
+   
+   // Clean up global variables if EA is being removed
+   if(reason == REASON_REMOVE || reason == REASON_CHARTCLOSE)
+   {
+      Print("Cleaning up global variables...");
+      GlobalVariableDel(GV_LOT_SIZE);
+      GlobalVariableDel(GV_HALF_RISK);
+      GlobalVariableDel(GV_OPEN_PRICE);
+      GlobalVariableDel(GV_SL);
+      GlobalVariableDel(GV_TP1);
+      GlobalVariableDel(GV_TP2);
+      GlobalVariableDel(GV_DIRECTION);
+      GlobalVariableDel(GV_EXECUTION);
+   }
+   
+   // Force chart redraw
+   ChartRedraw();
+   Sleep(100); // Give time for objects to be deleted
+   
+   Print("MultiTradeManager EA v2.0 deinitialized successfully");
 }
 
 //+------------------------------------------------------------------+
