@@ -67,6 +67,19 @@ private:
    bool              m_isMarketOrder;
    int               m_orderCount;
 
+   // Breakeven tracking structures
+   struct TradeSetup
+   {
+      ulong          magicNumber;
+      double         tp1;
+      double         tp2;
+      string         beMode;        // "Disabled", "After TP1", "After TP2"
+      bool           beActivated;
+   };
+
+   TradeSetup        m_tradeSetups[];
+   int               m_setupCount;
+
 public:
                      CTradeUtilityDialog();
                     ~CTradeUtilityDialog();
@@ -86,6 +99,7 @@ protected:
    void              OnClickSell();
    void              OnClickCancelAll();
    void              OnClickCloseAll();
+   void              ProcessBreakeven();
    bool              ValidatePendingPrice(bool isBuy, double entryPrice);
    double            GetMinLot();
    virtual bool      OnEvent(const int id, const long &lparam, const double &dparam, const string &sparam);
@@ -98,6 +112,8 @@ CTradeUtilityDialog::CTradeUtilityDialog()
 {
    m_isMarketOrder = true;
    m_orderCount = 1;
+   m_setupCount = 0;
+   ArrayResize(m_tradeSetups, 0);
 }
 
 //+------------------------------------------------------------------+
@@ -751,6 +767,25 @@ void CTradeUtilityDialog::OnClickBuy()
          return;
    }
 
+   // Generate unique magic number for this trade setup (based on timestamp)
+   ulong magicNumber = (ulong)TimeLocal();
+
+   // Store this trade setup information for breakeven tracking
+   TradeSetup newSetup;
+   newSetup.magicNumber = magicNumber;
+   newSetup.tp1 = tp1Price;
+   newSetup.tp2 = tp2Price;
+   newSetup.beMode = m_cmbBreakeven.Select();
+   newSetup.beActivated = false;
+
+   // Add to array
+   ArrayResize(m_tradeSetups, m_setupCount + 1);
+   m_tradeSetups[m_setupCount] = newSetup;
+   m_setupCount++;
+
+   // Set magic number for CTrade
+   trade.SetExpertMagicNumber(magicNumber);
+
    // Place orders based on order count
    for(int i = 0; i < m_orderCount; i++)
    {
@@ -824,6 +859,25 @@ void CTradeUtilityDialog::OnClickSell()
       if(!ValidatePendingPrice(false, entryPrice))
          return;
    }
+
+   // Generate unique magic number for this trade setup (based on timestamp)
+   ulong magicNumber = (ulong)TimeLocal();
+
+   // Store this trade setup information for breakeven tracking
+   TradeSetup newSetup;
+   newSetup.magicNumber = magicNumber;
+   newSetup.tp1 = tp1Price;
+   newSetup.tp2 = tp2Price;
+   newSetup.beMode = m_cmbBreakeven.Select();
+   newSetup.beActivated = false;
+
+   // Add to array
+   ArrayResize(m_tradeSetups, m_setupCount + 1);
+   m_tradeSetups[m_setupCount] = newSetup;
+   m_setupCount++;
+
+   // Set magic number for CTrade
+   trade.SetExpertMagicNumber(magicNumber);
 
    // Place orders based on order count
    for(int i = 0; i < m_orderCount; i++)
@@ -946,6 +1000,124 @@ void CTradeUtilityDialog::OnClickCloseAll()
 }
 
 //+------------------------------------------------------------------+
+//| Process Breakeven Logic for All Trade Setups                     |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::ProcessBreakeven()
+{
+   if(m_setupCount == 0)
+      return;
+
+   // Get current price
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int totalPositions = PositionsTotal();
+
+   // Loop through all trade setups
+   for(int s = 0; s < m_setupCount; s++)
+   {
+      // Skip if already activated or disabled
+      if(m_tradeSetups[s].beActivated || m_tradeSetups[s].beMode == "Disabled")
+         continue;
+
+      // Get the TP level to check based on this setup's mode
+      double tpLevel = 0;
+      if(m_tradeSetups[s].beMode == "After TP1")
+         tpLevel = m_tradeSetups[s].tp1;
+      else if(m_tradeSetups[s].beMode == "After TP2")
+         tpLevel = m_tradeSetups[s].tp2;
+
+      // Skip if TP level is not set
+      if(tpLevel == 0)
+         continue;
+
+      // Check if any position with this magic number reached TP
+      bool priceReachedTP = false;
+
+      for(int i = 0; i < totalPositions; i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0)
+         {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+               ulong posMagic = PositionGetInteger(POSITION_MAGIC);
+
+               if(posMagic == m_tradeSetups[s].magicNumber)
+               {
+                  long posType = PositionGetInteger(POSITION_TYPE);
+
+                  // Check if price has reached TP level
+                  if(posType == POSITION_TYPE_BUY && currentBid >= tpLevel)
+                  {
+                     priceReachedTP = true;
+                     break;
+                  }
+                  else if(posType == POSITION_TYPE_SELL && currentAsk <= tpLevel)
+                  {
+                     priceReachedTP = true;
+                     break;
+                  }
+               }
+            }
+         }
+      }
+
+      // If price reached TP, move all positions with this magic number to breakeven
+      if(priceReachedTP)
+      {
+         CTrade trade;
+         int movedCount = 0;
+
+         for(int i = 0; i < totalPositions; i++)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket > 0)
+            {
+               if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+               {
+                  ulong posMagic = PositionGetInteger(POSITION_MAGIC);
+
+                  if(posMagic == m_tradeSetups[s].magicNumber)
+                  {
+                     double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                     double currentSL = PositionGetDouble(POSITION_SL);
+                     double currentTP = PositionGetDouble(POSITION_TP);
+                     long posType = PositionGetInteger(POSITION_TYPE);
+
+                     // Only move SL if it's not already at or better than breakeven
+                     bool shouldMove = false;
+                     if(posType == POSITION_TYPE_BUY && (currentSL == 0 || currentSL < entryPrice))
+                        shouldMove = true;
+                     else if(posType == POSITION_TYPE_SELL && (currentSL == 0 || currentSL > entryPrice))
+                        shouldMove = true;
+
+                     if(shouldMove)
+                     {
+                        if(trade.PositionModify(ticket, entryPrice, currentTP))
+                        {
+                           movedCount++;
+                           Print("Position moved to breakeven. Ticket: ", ticket, " Magic: ", posMagic, " Entry: ", entryPrice);
+                        }
+                        else
+                        {
+                           Print("Failed to move position to breakeven. Ticket: ", ticket, " Error: ", trade.ResultRetcodeDescription());
+                        }
+                     }
+                  }
+               }
+            }
+         }
+
+         if(movedCount > 0)
+         {
+            m_tradeSetups[s].beActivated = true;
+            Print("Breakeven activated for setup #", s+1, ". ", movedCount, " position(s) moved to breakeven (", m_tradeSetups[s].beMode, ", Magic: ", m_tradeSetups[s].magicNumber, ")");
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| OnTick - Update entry price if market order                      |
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::OnTick()
@@ -960,6 +1132,9 @@ void CTradeUtilityDialog::OnTick()
       CalculateLotSize();
       UpdateDollarValues();
    }
+
+   // Process breakeven logic
+   ProcessBreakeven();
 }
 
 //+------------------------------------------------------------------+
