@@ -70,6 +70,7 @@ private:
    // Breakeven tracking structures
    struct TradeSetup
    {
+      string         symbol;        // Symbol this setup belongs to
       ulong          magicNumber;
       double         tp1;
       double         tp2;
@@ -102,6 +103,7 @@ protected:
    void              ProcessBreakeven();
    bool              ValidatePendingPrice(bool isBuy, double entryPrice);
    double            GetMinLot();
+   ulong             GetMagicNumberForSymbol(string symbol);
    virtual bool      OnEvent(const int id, const long &lparam, const double &dparam, const string &sparam);
 };
 
@@ -710,6 +712,33 @@ void CTradeUtilityDialog::UpdateDollarValues()
 }
 
 //+------------------------------------------------------------------+
+//| Generate magic number for symbol (with symbol-specific range)    |
+//+------------------------------------------------------------------+
+ulong CTradeUtilityDialog::GetMagicNumberForSymbol(string symbol)
+{
+   // Create a hash from the symbol name to get a unique identifier (0-99)
+   int symbolHash = 0;
+   for(int i = 0; i < StringLen(symbol); i++)
+   {
+      symbolHash += (int)StringGetCharacter(symbol, i);
+   }
+   symbolHash = symbolHash % 100;  // Limit to 0-99
+
+   // Get current tick count (milliseconds since system start)
+   // This provides much better precision than TimeLocal() (seconds)
+   // allowing multiple setups per second without collision
+   ulong tickCount = GetTickCount64();
+
+   // Combine: First 2 digits = symbol hash, rest = tick count
+   // This ensures different symbols have different magic number ranges
+   // while guaranteeing uniqueness even for rapid consecutive setups
+   // Format: [SymbolHash 00-99][TickCount milliseconds]
+   ulong magicNumber = ((ulong)symbolHash * 100000000000000) + (tickCount % 100000000000000);
+
+   return magicNumber;
+}
+
+//+------------------------------------------------------------------+
 //| Validate pending order price                                     |
 //+------------------------------------------------------------------+
 bool CTradeUtilityDialog::ValidatePendingPrice(bool isBuy, double entryPrice)
@@ -767,11 +796,12 @@ void CTradeUtilityDialog::OnClickBuy()
          return;
    }
 
-   // Generate unique magic number for this trade setup (based on timestamp)
-   ulong magicNumber = (ulong)TimeLocal();
+   // Generate unique magic number for this trade setup (symbol-specific range)
+   ulong magicNumber = GetMagicNumberForSymbol(_Symbol);
 
    // Store this trade setup information for breakeven tracking
    TradeSetup newSetup;
+   newSetup.symbol = _Symbol;           // Store the symbol for this setup
    newSetup.magicNumber = magicNumber;
    newSetup.tp1 = tp1Price;
    newSetup.tp2 = tp2Price;
@@ -797,7 +827,7 @@ void CTradeUtilityDialog::OnClickBuy()
       else if(i == 2 && tp3Price > 0) tpPrice = tp3Price;
       else if(i == 3 && tp4Price > 0) tpPrice = tp4Price;
 
-      string comment = "TradeUtility #" + IntegerToString(i + 1);
+      string comment = "TradeUtility #" + IntegerToString(i + 1) + " [" + _Symbol + "]";
 
       bool result = false;
       if(m_isMarketOrder)
@@ -860,11 +890,12 @@ void CTradeUtilityDialog::OnClickSell()
          return;
    }
 
-   // Generate unique magic number for this trade setup (based on timestamp)
-   ulong magicNumber = (ulong)TimeLocal();
+   // Generate unique magic number for this trade setup (symbol-specific range)
+   ulong magicNumber = GetMagicNumberForSymbol(_Symbol);
 
    // Store this trade setup information for breakeven tracking
    TradeSetup newSetup;
+   newSetup.symbol = _Symbol;           // Store the symbol for this setup
    newSetup.magicNumber = magicNumber;
    newSetup.tp1 = tp1Price;
    newSetup.tp2 = tp2Price;
@@ -890,7 +921,7 @@ void CTradeUtilityDialog::OnClickSell()
       else if(i == 2 && tp3Price > 0) tpPrice = tp3Price;
       else if(i == 3 && tp4Price > 0) tpPrice = tp4Price;
 
-      string comment = "TradeUtility #" + IntegerToString(i + 1);
+      string comment = "TradeUtility #" + IntegerToString(i + 1) + " [" + _Symbol + "]";
 
       bool result = false;
       if(m_isMarketOrder)
@@ -1000,19 +1031,16 @@ void CTradeUtilityDialog::OnClickCloseAll()
 }
 
 //+------------------------------------------------------------------+
-//| Process Breakeven Logic for All Trade Setups                     |
+//| Process Breakeven Logic for All Trade Setups (All Symbols)       |
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::ProcessBreakeven()
 {
    if(m_setupCount == 0)
       return;
 
-   // Get current price
-   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    int totalPositions = PositionsTotal();
 
-   // Loop through all trade setups
+   // Loop through all trade setups (across all symbols)
    for(int s = 0; s < m_setupCount; s++)
    {
       // Skip if already activated or disabled
@@ -1030,6 +1058,10 @@ void CTradeUtilityDialog::ProcessBreakeven()
       if(tpLevel == 0)
          continue;
 
+      // Get current price for THIS setup's symbol
+      double currentBid = SymbolInfoDouble(m_tradeSetups[s].symbol, SYMBOL_BID);
+      double currentAsk = SymbolInfoDouble(m_tradeSetups[s].symbol, SYMBOL_ASK);
+
       // Check if any position with this magic number reached TP
       bool priceReachedTP = false;
 
@@ -1038,12 +1070,18 @@ void CTradeUtilityDialog::ProcessBreakeven()
          ulong ticket = PositionGetTicket(i);
          if(ticket > 0)
          {
-            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            // Check if position belongs to this setup's symbol
+            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol)
             {
                ulong posMagic = PositionGetInteger(POSITION_MAGIC);
 
                if(posMagic == m_tradeSetups[s].magicNumber)
                {
+                  // Verify this is a TradeUtility position using comment
+                  string posComment = PositionGetString(POSITION_COMMENT);
+                  if(StringFind(posComment, "TradeUtility") < 0)
+                     continue;  // Skip if not created by this EA
+
                   long posType = PositionGetInteger(POSITION_TYPE);
 
                   // Check if price has reached TP level
@@ -1073,12 +1111,18 @@ void CTradeUtilityDialog::ProcessBreakeven()
             ulong ticket = PositionGetTicket(i);
             if(ticket > 0)
             {
-               if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+               // Check if position belongs to this setup's symbol
+               if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol)
                {
                   ulong posMagic = PositionGetInteger(POSITION_MAGIC);
 
                   if(posMagic == m_tradeSetups[s].magicNumber)
                   {
+                     // Verify this is a TradeUtility position using comment
+                     string posComment = PositionGetString(POSITION_COMMENT);
+                     if(StringFind(posComment, "TradeUtility") < 0)
+                        continue;  // Skip if not created by this EA
+
                      double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
                      double currentSL = PositionGetDouble(POSITION_SL);
                      double currentTP = PositionGetDouble(POSITION_TP);
@@ -1096,7 +1140,7 @@ void CTradeUtilityDialog::ProcessBreakeven()
                         if(trade.PositionModify(ticket, entryPrice, currentTP))
                         {
                            movedCount++;
-                           Print("Position moved to breakeven. Ticket: ", ticket, " Magic: ", posMagic, " Entry: ", entryPrice);
+                           Print("Position moved to breakeven. Ticket: ", ticket, " Symbol: ", m_tradeSetups[s].symbol, " Magic: ", posMagic, " Entry: ", entryPrice);
                         }
                         else
                         {
@@ -1111,7 +1155,7 @@ void CTradeUtilityDialog::ProcessBreakeven()
          if(movedCount > 0)
          {
             m_tradeSetups[s].beActivated = true;
-            Print("Breakeven activated for setup #", s+1, ". ", movedCount, " position(s) moved to breakeven (", m_tradeSetups[s].beMode, ", Magic: ", m_tradeSetups[s].magicNumber, ")");
+            Print("Breakeven activated for setup #", s+1, " [", m_tradeSetups[s].symbol, "]. ", movedCount, " position(s) moved to breakeven (", m_tradeSetups[s].beMode, ", Magic: ", m_tradeSetups[s].magicNumber, ")");
          }
       }
    }
