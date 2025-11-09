@@ -578,11 +578,12 @@ void CTradeUtilityDialog::CalculateLotSize()
    double entryPrice = StringToDouble(m_edtEntryPrice.Text());
 
    double lotSize = 0;
+   double minLot = GetMinLot();
 
-   // If SL is not set, use fixed ratio: 0.01 lot per $1000 balance
+   // If SL is not set, use fixed ratio: minimum allowed lot per $1000 balance
    if(slPrice == 0)
    {
-      lotSize = balance / 1000.0 * 0.01;
+      lotSize = balance / 1000.0 * minLot;
    }
    else if(entryPrice == 0)
    {
@@ -596,8 +597,8 @@ void CTradeUtilityDialog::CalculateLotSize()
 
       if(slDistance == 0)
       {
-         // SL is same as entry, use default ratio
-         lotSize = balance / 1000.0 * 0.01;
+         // SL is same as entry, use minimum allowed lot per $1000 ratio
+         lotSize = balance / 1000.0 * minLot;
       }
       else
       {
@@ -615,7 +616,6 @@ void CTradeUtilityDialog::CalculateLotSize()
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
 
    // Apply min/max constraints
-   double minLot = GetMinLot();
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
 
    if(lotSize < minLot) lotSize = minLot;
