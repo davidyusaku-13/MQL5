@@ -1,0 +1,26 @@
+now add these.. make sure to follow these exact layout
+
+Symbol: XXXYYY
+Min. Allowed Lot: x.xx(depends automatically on the symbol)
+Risk % of Balance: [input of float, default 1.0]
+Order Type: [dropdown with choices of MARKET or PENDING]
+Entry Price: xxx.xxx(format will follow the symbol)(if MARKET is selected, it will update every tick showing the exact price at every tick, if PENDING is selected it will default to 00.00 so user can input any price they want)
+Order Count: [dropdown with choices of 1 2 3 4, so there will be 1 up to 4 order... default will be 1]
+Lot Size: [disabled input of float, this will autocalculate based on the SL and Risk% as well as the Balance, as well as the minimum allowed lot on each symbol]
+SL $xx.xx(red color): [input of price, NOT POINTS] 
+TP1 $xx.xx(green color): [input of price, NOT POINTS]
+TP2 $xx.xx(green color): [input of price, NOT POINTS](make this input disabled if the order count is less than 2)
+TP3 $xx.xx(green color): [input of price, NOT POINTS](make this input disabled if the order count is less than 3)
+TP4 $xx.xx(green color): [input of price, NOT POINTS](make this input disabled if the order count is less than 4)
+Breakeven: [dropdown with choices of Disabled, After TP1, and After TP2... default will be Disabled]
+[BUY NOW button with blue color background and white text] [SELL NOW button with red color background and white text]
+[Cancel All Order button with grey background and black text]
+[Close All Position button ]
+
+notes:
+- make sure the disabled inputs have greyish accent to make the UX better
+- the BUY NOW and SELL NOW button will autochange depends on the Order Type selected, if MARKET is selected it will be BUY NOW and SELL NOW, if PENDING is selected it will be BUY LIMIT or SELL LIMIT
+- follow this guide for buttons https://www.mql5.com/en/docs/standardlibrary/controls/cbutton
+- follow this guide for combobox/dropdown https://www.mql5.com/en/docs/standardlibrary/controls/ccombobox
+- follow this guide for colors https://www.mql5.com/en/docs/standardlibrary/controls/cwndobj/cwndobjcolor
+- follow this guide for ENUM_CHART_EVENT https://www.mql5.com/en/docs/constants/chartconstants/enum_chartevents
