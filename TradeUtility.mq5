@@ -122,8 +122,6 @@ protected:
    double            GetMinLot();
    ulong             GetMagicNumberForSymbol(string symbol);
    void              SetComboBoxFontSize(CComboBox &combobox, int fontSize);
-   string            EncodeSetupInComment(int orderIndex, string symbol, ulong magicNumber, double tp1, double tp2, string beMode);
-   bool              DecodeSetupFromComment(string comment, string &symbol, ulong &magicNumber, double &tp1, double &tp2, string &beMode);
    virtual bool      OnEvent(const int id, const long &lparam, const double &dparam, const string &sparam);
 };
 
@@ -133,7 +131,7 @@ protected:
 CTradeUtilityDialog::CTradeUtilityDialog()
 {
    m_isMarketOrder = true;
-   m_orderCount = 1;
+   m_orderCount = 2;
    m_fontSize = 10;
    m_setupCount = 0;
    ArrayResize(m_tradeSetups, 0);
@@ -296,7 +294,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_cmbOrderCount.ItemAdd("2");
    m_cmbOrderCount.ItemAdd("3");
    m_cmbOrderCount.ItemAdd("4");
-   m_cmbOrderCount.Select(0);
+   m_cmbOrderCount.Select(1);
    SetComboBoxFontSize(m_cmbOrderCount, m_fontSize);
    if(!Add(m_cmbOrderCount))
       return false;
@@ -471,7 +469,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_cmbBreakeven.ItemAdd("Disabled");
    m_cmbBreakeven.ItemAdd("After TP1");
    m_cmbBreakeven.ItemAdd("After TP2");
-   m_cmbBreakeven.Select(0);
+   m_cmbBreakeven.Select(1);
    SetComboBoxFontSize(m_cmbBreakeven, m_fontSize);
    if(!Add(m_cmbBreakeven))
       return false;
@@ -813,124 +811,6 @@ ulong CTradeUtilityDialog::GetMagicNumberForSymbol(string symbol)
 }
 
 //+------------------------------------------------------------------+
-//| Encode setup data into order comment                             |
-//+------------------------------------------------------------------+
-string CTradeUtilityDialog::EncodeSetupInComment(int orderIndex, string symbol, ulong magicNumber, double tp1, double tp2, string beMode)
-{
-   // Format: "TradeUtility #1 [EURUSD] |MN:123456789|TP1:1.08500|TP2:1.09000|BE:After TP1|"
-   string comment = "TradeUtility #" + IntegerToString(orderIndex) + " [" + symbol + "] ";
-   comment += "|MN:" + IntegerToString(magicNumber) + "|";
-   comment += "TP1:" + DoubleToString(tp1, 5) + "|";
-   comment += "TP2:" + DoubleToString(tp2, 5) + "|";
-   comment += "BE:" + beMode + "|";
-   return comment;
-}
-
-//+------------------------------------------------------------------+
-//| Decode setup data from order comment                             |
-//+------------------------------------------------------------------+
-bool CTradeUtilityDialog::DecodeSetupFromComment(string comment, string &symbol, ulong &magicNumber, double &tp1, double &tp2, string &beMode)
-{
-   // Check if this is a TradeUtility comment
-   if(StringFind(comment, "TradeUtility") < 0)
-      return false;
-
-   // Extract symbol from [SYMBOL] pattern
-   int symbolStart = StringFind(comment, "[");
-   int symbolEnd = StringFind(comment, "]");
-   if(symbolStart >= 0 && symbolEnd > symbolStart)
-   {
-      symbol = StringSubstr(comment, symbolStart + 1, symbolEnd - symbolStart - 1);
-   }
-   else
-   {
-      return false;  // Invalid format - need at least symbol
-   }
-
-   // Extract magic number (REQUIRED - but handle truncated comments)
-   int mnStart = StringFind(comment, "|MN:");
-   if(mnStart >= 0)
-   {
-      mnStart += 4;  // Skip "|MN:"
-      int mnEnd = StringFind(comment, "|", mnStart);
-
-      // Handle truncated comments - read to end if no closing delimiter
-      if(mnEnd < 0)
-         mnEnd = StringLen(comment);
-
-      if(mnEnd > mnStart)
-      {
-         string mnStr = StringSubstr(comment, mnStart, mnEnd - mnStart);
-         magicNumber = (ulong)StringToInteger(mnStr);
-      }
-      else
-         return false;  // No magic number value
-   }
-   else
-      return false;  // No magic number field
-
-   // Initialize optional fields with defaults
-   tp1 = 0;
-   tp2 = 0;
-   beMode = "Disabled";
-
-   // Extract TP1 (OPTIONAL)
-   int tp1Start = StringFind(comment, "|TP1:");
-   if(tp1Start >= 0)
-   {
-      tp1Start += 5;  // Skip "|TP1:"
-      int tp1End = StringFind(comment, "|", tp1Start);
-
-      // Handle truncated comments
-      if(tp1End < 0)
-         tp1End = StringLen(comment);
-
-      if(tp1End > tp1Start)
-      {
-         string tp1Str = StringSubstr(comment, tp1Start, tp1End - tp1Start);
-         tp1 = StringToDouble(tp1Str);
-      }
-   }
-
-   // Extract TP2 (OPTIONAL)
-   int tp2Start = StringFind(comment, "|TP2:");
-   if(tp2Start >= 0)
-   {
-      tp2Start += 5;  // Skip "|TP2:"
-      int tp2End = StringFind(comment, "|", tp2Start);
-
-      // Handle truncated comments
-      if(tp2End < 0)
-         tp2End = StringLen(comment);
-
-      if(tp2End > tp2Start)
-      {
-         string tp2Str = StringSubstr(comment, tp2Start, tp2End - tp2Start);
-         tp2 = StringToDouble(tp2Str);
-      }
-   }
-
-   // Extract Breakeven mode (OPTIONAL)
-   int beStart = StringFind(comment, "|BE:");
-   if(beStart >= 0)
-   {
-      beStart += 4;  // Skip "|BE:"
-      int beEnd = StringFind(comment, "|", beStart);
-
-      // Handle truncated comments
-      if(beEnd < 0)
-         beEnd = StringLen(comment);
-
-      if(beEnd > beStart)
-      {
-         beMode = StringSubstr(comment, beStart, beEnd - beStart);
-      }
-   }
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
 //| Reconstruct trade setups from existing positions                 |
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::ReconstructSetups()
@@ -955,6 +835,7 @@ void CTradeUtilityDialog::ReconstructSetups()
       double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
       int tpIndex = 0;
 
+      // Scan pending orders for TP values
       for(int j = 0; j < totalOrders; j++)
       {
          ulong ticket = OrderGetTicket(j);
@@ -973,7 +854,26 @@ void CTradeUtilityDialog::ReconstructSetups()
          }
       }
 
-      // Update TP values if we found any from orders
+      // Scan open positions for TP values (for filled orders)
+      for(int p = 0; p < totalPositions; p++)
+      {
+         ulong pTicket = PositionGetTicket(p);
+         if(pTicket > 0)
+         {
+            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
+               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
+            {
+               double posTP = PositionGetDouble(POSITION_TP);
+               if(posTP > 0 && tpIndex < 4)
+               {
+                  tpValues[tpIndex] = posTP;
+                  tpIndex++;
+               }
+            }
+         }
+      }
+
+      // Update TP values if we found any from orders/positions
       if(tpValues[0] > 0) m_tradeSetups[s].tp1 = tpValues[0];
       if(tpValues[1] > 0) m_tradeSetups[s].tp2 = tpValues[1];
 
@@ -1051,15 +951,6 @@ void CTradeUtilityDialog::ReconstructSetups()
 
          if(!alreadyProcessed)
          {
-            // Try to decode additional setup data from comment (may be truncated)
-            string commentSymbol;
-            ulong commentMagic;
-            double tp1, tp2;
-            string beMode;
-
-            // Decode what we can from the comment
-            bool decoded = DecodeSetupFromComment(orderComment, commentSymbol, commentMagic, tp1, tp2, beMode);
-
             // Collect TP values from ALL orders with this magic number
             double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
             int tpIndex = 0;
@@ -1085,10 +976,10 @@ void CTradeUtilityDialog::ReconstructSetups()
             // Create setup using ACTUAL order properties
             TradeSetup newSetup;
             newSetup.symbol = orderSymbol;  // Use actual order symbol
-            newSetup.magicNumber = orderMagic;  // Use actual order magic (not truncated)
+            newSetup.magicNumber = orderMagic;  // Use actual order magic
             newSetup.tp1 = tpValues[0];  // Use TP from first order with this magic
             newSetup.tp2 = tpValues[1];  // Use TP from second order with this magic
-            newSetup.beMode = decoded ? beMode : "Disabled";  // Use decoded BE mode if available
+            newSetup.beMode = "Disabled";  // Default - actual BE mode loaded from CSV if available
             newSetup.beActivated = false;  // Pending orders can't have BE activated yet
 
             ArrayResize(m_tradeSetups, m_setupCount + 1);
@@ -1105,7 +996,7 @@ void CTradeUtilityDialog::ReconstructSetups()
             Print("    Magic Number: ", orderMagic, " (from order properties)");
             Print("    TP1: ", DoubleToString(newSetup.tp1, 5), (newSetup.tp1 > 0 ? " (from ORDER_TP)" : " (no TP set)"));
             Print("    TP2: ", DoubleToString(newSetup.tp2, 5), (newSetup.tp2 > 0 ? " (from ORDER_TP)" : " (no TP set)"));
-            Print("    Breakeven Mode: ", beMode, decoded ? " (from comment)" : " (default)");
+            Print("    Breakeven Mode: ", newSetup.beMode, " (default - loaded from CSV if saved)");
             Print("    Status: Pending (not yet filled)");
             Print("    ---");
          }
@@ -1119,78 +1010,97 @@ void CTradeUtilityDialog::ReconstructSetups()
       if(ticket > 0)
       {
          string posComment = PositionGetString(POSITION_COMMENT);
+         string posSymbol = PositionGetString(POSITION_SYMBOL);
+         ulong posMagic = PositionGetInteger(POSITION_MAGIC);
 
-         // Try to decode setup from comment
-         string symbol;
-         ulong magicNumber;
-         double tp1, tp2;
-         string beMode;
+         // Check if this is a TradeUtility position by comment
+         if(StringFind(posComment, "TradeUtility") < 0)
+            continue;  // Not a TradeUtility position
 
-         if(DecodeSetupFromComment(posComment, symbol, magicNumber, tp1, tp2, beMode))
+         // Check if we already processed this magic number
+         bool alreadyProcessed = false;
+         for(int j = 0; j < processedCount; j++)
          {
-            // Check if we already processed this magic number
-            bool alreadyProcessed = false;
-            for(int j = 0; j < processedCount; j++)
+            if(processedMagicNumbers[j] == posMagic)
             {
-               if(processedMagicNumbers[j] == magicNumber)
-               {
-                  alreadyProcessed = true;
-                  break;
-               }
+               alreadyProcessed = true;
+               break;
             }
+         }
 
-            if(!alreadyProcessed)
+         if(!alreadyProcessed)
+         {
+            // Collect TP values from ALL positions with this magic number
+            double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
+            int tpIndex = 0;
+
+            for(int p = 0; p < totalPositions; p++)
             {
-               // Add this setup
-               TradeSetup newSetup;
-               newSetup.symbol = symbol;
-               newSetup.magicNumber = magicNumber;
-               newSetup.tp1 = tp1;
-               newSetup.tp2 = tp2;
-               newSetup.beMode = beMode;
-               newSetup.beActivated = false;
-
-               // Check if breakeven already activated by examining positions
-               // If any position with this magic has SL at entry price, it's activated
-               for(int p = 0; p < totalPositions; p++)
+               ulong scanTicket = PositionGetTicket(p);
+               if(scanTicket > 0)
                {
-                  ulong pTicket = PositionGetTicket(p);
-                  if(pTicket > 0)
+                  if(PositionGetString(POSITION_SYMBOL) == posSymbol &&
+                     PositionGetInteger(POSITION_MAGIC) == posMagic)
                   {
-                     if(PositionGetString(POSITION_SYMBOL) == symbol &&
-                        PositionGetInteger(POSITION_MAGIC) == magicNumber)
+                     double posTP = PositionGetDouble(POSITION_TP);
+                     if(posTP > 0 && tpIndex < 4)
                      {
-                        double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-                        double currentSL = PositionGetDouble(POSITION_SL);
-
-                        // Check if SL is at or very close to entry (within 1 pip tolerance)
-                        if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
-                        {
-                           newSetup.beActivated = true;
-                           break;
-                        }
+                        tpValues[tpIndex] = posTP;
+                        tpIndex++;
                      }
                   }
                }
-
-               ArrayResize(m_tradeSetups, m_setupCount + 1);
-               m_tradeSetups[m_setupCount] = newSetup;
-               m_setupCount++;
-
-               // Mark as processed
-               ArrayResize(processedMagicNumbers, processedCount + 1);
-               processedMagicNumbers[processedCount] = magicNumber;
-               processedCount++;
-
-               Print("  Setup #", m_setupCount, " RECONSTRUCTED (from OPEN POSITION):");
-               Print("    Symbol: ", symbol);
-               Print("    Magic Number: ", magicNumber);
-               Print("    TP1: ", DoubleToString(tp1, 5));
-               Print("    TP2: ", DoubleToString(tp2, 5));
-               Print("    Breakeven Mode: ", beMode);
-               Print("    Breakeven Activated: ", (newSetup.beActivated ? "YES" : "NO"));
-               Print("    ---");
             }
+
+            // Create setup using ACTUAL position properties
+            TradeSetup newSetup;
+            newSetup.symbol = posSymbol;  // Use actual position symbol
+            newSetup.magicNumber = posMagic;  // Use actual position magic
+            newSetup.tp1 = tpValues[0];  // Use TP from first position with this magic
+            newSetup.tp2 = tpValues[1];  // Use TP from second position with this magic
+            newSetup.beMode = "Disabled";  // Default - actual BE mode loaded from CSV if available
+            newSetup.beActivated = false;
+
+            // Check if breakeven already activated by examining positions
+            // If any position with this magic has SL at entry price, it's activated
+            for(int p = 0; p < totalPositions; p++)
+            {
+               ulong pTicket = PositionGetTicket(p);
+               if(pTicket > 0)
+               {
+                  if(PositionGetString(POSITION_SYMBOL) == posSymbol &&
+                     PositionGetInteger(POSITION_MAGIC) == posMagic)
+                  {
+                     double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                     double currentSL = PositionGetDouble(POSITION_SL);
+
+                     // Check if SL is at or very close to entry (within 1 pip tolerance)
+                     if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
+                     {
+                        newSetup.beActivated = true;
+                        break;
+                     }
+                  }
+               }
+            }
+
+            ArrayResize(m_tradeSetups, m_setupCount + 1);
+            m_tradeSetups[m_setupCount] = newSetup;
+            m_setupCount++;
+
+            // Mark as processed (using ACTUAL magic number)
+            ArrayResize(processedMagicNumbers, processedCount + 1);
+            processedMagicNumbers[processedCount] = posMagic;
+            processedCount++;
+
+            Print("  Setup #", m_setupCount, " RECONSTRUCTED (from OPEN POSITION):");
+            Print("    Symbol: ", posSymbol);
+            Print("    Magic Number: ", posMagic, " (from position properties)");
+            Print("    TP1: ", DoubleToString(newSetup.tp1, 5), (newSetup.tp1 > 0 ? " (from POSITION_TP)" : " (no TP set)"));
+            Print("    TP2: ", DoubleToString(newSetup.tp2, 5), (newSetup.tp2 > 0 ? " (from POSITION_TP)" : " (no TP set)"));
+            Print("    Breakeven Mode: ", newSetup.beMode, " (default - loaded from CSV if saved)");
+            Print("    Breakeven Activated: ", (newSetup.beActivated ? "YES" : "NO"));
+            Print("    ---");
          }
       }
    }
@@ -1413,6 +1323,7 @@ void CTradeUtilityDialog::RefreshSetupsFromOrders()
       double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
       int tpIndex = 0;
 
+      // Scan pending orders for TP values
       for(int j = 0; j < totalOrders; j++)
       {
          ulong ticket = OrderGetTicket(j);
@@ -1431,7 +1342,26 @@ void CTradeUtilityDialog::RefreshSetupsFromOrders()
          }
       }
 
-      // Update TP values if we found any from orders
+      // Scan open positions for TP values (for filled orders)
+      for(int p = 0; p < totalPositions; p++)
+      {
+         ulong pTicket = PositionGetTicket(p);
+         if(pTicket > 0)
+         {
+            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
+               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
+            {
+               double posTP = PositionGetDouble(POSITION_TP);
+               if(posTP > 0 && tpIndex < 4)
+               {
+                  tpValues[tpIndex] = posTP;
+                  tpIndex++;
+               }
+            }
+         }
+      }
+
+      // Update TP values if we found any from orders/positions
       if(tpValues[0] > 0) m_tradeSetups[s].tp1 = tpValues[0];
       if(tpValues[1] > 0) m_tradeSetups[s].tp2 = tpValues[1];
 
@@ -1578,8 +1508,8 @@ void CTradeUtilityDialog::OnClickBuy()
       else if(i == 2 && tp3Price > 0) tpPrice = tp3Price;
       else if(i == 3 && tp4Price > 0) tpPrice = tp4Price;
 
-      // Use enhanced comment with setup data
-      string comment = EncodeSetupInComment(i + 1, _Symbol, magicNumber, tp1Price, tp2Price, newSetup.beMode);
+      // Simple readable comment: "TradeUtility BTCUSD #1"
+      string comment = "TradeUtility " + _Symbol + " #" + IntegerToString(i + 1);
 
       bool result = false;
       if(m_isMarketOrder)
@@ -1676,8 +1606,8 @@ void CTradeUtilityDialog::OnClickSell()
       else if(i == 2 && tp3Price > 0) tpPrice = tp3Price;
       else if(i == 3 && tp4Price > 0) tpPrice = tp4Price;
 
-      // Use enhanced comment with setup data
-      string comment = EncodeSetupInComment(i + 1, _Symbol, magicNumber, tp1Price, tp2Price, newSetup.beMode);
+      // Simple readable comment: "TradeUtility BTCUSD #1"
+      string comment = "TradeUtility " + _Symbol + " #" + IntegerToString(i + 1);
 
       bool result = false;
       if(m_isMarketOrder)
