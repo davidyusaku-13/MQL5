@@ -17,7 +17,8 @@
 //+------------------------------------------------------------------+
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
-input int FontSize = 10;  // Font size for all UI elements
+input int FontSize = 10;                    // Font size for all UI elements
+input int AutoSaveIntervalSeconds = 30;     // Auto-save interval (0 = disabled)
 
 //+------------------------------------------------------------------+
 //| Custom Dialog Class                                              |
@@ -86,6 +87,9 @@ private:
 
    TradeSetup        m_tradeSetups[];
    int               m_setupCount;
+   string            m_persistenceFile;
+   datetime          m_lastSaveTime;
+   int               m_saveIntervalSeconds;
 
 public:
                      CTradeUtilityDialog();
@@ -95,6 +99,10 @@ public:
    virtual void      OnTick();
    void              ReconstructSetups();
    void              CleanupCompletedSetups();
+   void              SaveSetupsToDisk();
+   void              LoadSetupsFromDisk();
+   void              RefreshSetupsFromOrders();
+   void              PeriodicSave();
 
 protected:
    virtual bool      CreateControls();
@@ -129,6 +137,9 @@ CTradeUtilityDialog::CTradeUtilityDialog()
    m_fontSize = 10;
    m_setupCount = 0;
    ArrayResize(m_tradeSetups, 0);
+   m_persistenceFile = "TradeUtility_Setups.csv";
+   m_lastSaveTime = 0;
+   m_saveIntervalSeconds = AutoSaveIntervalSeconds;  // From input parameter
 }
 
 //+------------------------------------------------------------------+
@@ -833,32 +844,47 @@ bool CTradeUtilityDialog::DecodeSetupFromComment(string comment, string &symbol,
    }
    else
    {
-      return false;  // Invalid format
+      return false;  // Invalid format - need at least symbol
    }
 
-   // Extract magic number
+   // Extract magic number (REQUIRED - but handle truncated comments)
    int mnStart = StringFind(comment, "|MN:");
    if(mnStart >= 0)
    {
       mnStart += 4;  // Skip "|MN:"
       int mnEnd = StringFind(comment, "|", mnStart);
+
+      // Handle truncated comments - read to end if no closing delimiter
+      if(mnEnd < 0)
+         mnEnd = StringLen(comment);
+
       if(mnEnd > mnStart)
       {
          string mnStr = StringSubstr(comment, mnStart, mnEnd - mnStart);
          magicNumber = (ulong)StringToInteger(mnStr);
       }
       else
-         return false;
+         return false;  // No magic number value
    }
    else
-      return false;  // Old format without setup data
+      return false;  // No magic number field
 
-   // Extract TP1
+   // Initialize optional fields with defaults
+   tp1 = 0;
+   tp2 = 0;
+   beMode = "Disabled";
+
+   // Extract TP1 (OPTIONAL)
    int tp1Start = StringFind(comment, "|TP1:");
    if(tp1Start >= 0)
    {
       tp1Start += 5;  // Skip "|TP1:"
       int tp1End = StringFind(comment, "|", tp1Start);
+
+      // Handle truncated comments
+      if(tp1End < 0)
+         tp1End = StringLen(comment);
+
       if(tp1End > tp1Start)
       {
          string tp1Str = StringSubstr(comment, tp1Start, tp1End - tp1Start);
@@ -866,12 +892,17 @@ bool CTradeUtilityDialog::DecodeSetupFromComment(string comment, string &symbol,
       }
    }
 
-   // Extract TP2
+   // Extract TP2 (OPTIONAL)
    int tp2Start = StringFind(comment, "|TP2:");
    if(tp2Start >= 0)
    {
       tp2Start += 5;  // Skip "|TP2:"
       int tp2End = StringFind(comment, "|", tp2Start);
+
+      // Handle truncated comments
+      if(tp2End < 0)
+         tp2End = StringLen(comment);
+
       if(tp2End > tp2Start)
       {
          string tp2Str = StringSubstr(comment, tp2Start, tp2End - tp2Start);
@@ -879,12 +910,17 @@ bool CTradeUtilityDialog::DecodeSetupFromComment(string comment, string &symbol,
       }
    }
 
-   // Extract Breakeven mode
+   // Extract Breakeven mode (OPTIONAL)
    int beStart = StringFind(comment, "|BE:");
    if(beStart >= 0)
    {
       beStart += 4;  // Skip "|BE:"
       int beEnd = StringFind(comment, "|", beStart);
+
+      // Handle truncated comments
+      if(beEnd < 0)
+         beEnd = StringLen(comment);
+
       if(beEnd > beStart)
       {
          beMode = StringSubstr(comment, beStart, beEnd - beStart);
@@ -899,17 +935,184 @@ bool CTradeUtilityDialog::DecodeSetupFromComment(string comment, string &symbol,
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::ReconstructSetups()
 {
-   // Clear existing setups
-   ArrayResize(m_tradeSetups, 0);
-   m_setupCount = 0;
+   Print("========================================");
+   Print("EA INITIALIZED - Reconstructing Trade Setups");
+   Print("========================================");
+
+   // Step 1: Load from disk first (has full TP1/TP2/BE data)
+   LoadSetupsFromDisk();
 
    int totalPositions = PositionsTotal();
+   int totalOrders = OrdersTotal();
+   Print("Total open positions found: ", totalPositions);
+   Print("Total pending orders found: ", totalOrders);
 
-   // Array to track which magic numbers we've already added
+   // Step 2: Update loaded setups with fresh data from orders/positions
+   Print("Updating loaded setups with current order/position data...");
+   for(int s = 0; s < m_setupCount; s++)
+   {
+      // Collect TP values from ALL orders with this magic number
+      double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
+      int tpIndex = 0;
+
+      for(int j = 0; j < totalOrders; j++)
+      {
+         ulong ticket = OrderGetTicket(j);
+         if(ticket > 0)
+         {
+            if(OrderGetString(ORDER_SYMBOL) == m_tradeSetups[s].symbol &&
+               OrderGetInteger(ORDER_MAGIC) == m_tradeSetups[s].magicNumber)
+            {
+               double orderTP = OrderGetDouble(ORDER_TP);
+               if(orderTP > 0 && tpIndex < 4)
+               {
+                  tpValues[tpIndex] = orderTP;
+                  tpIndex++;
+               }
+            }
+         }
+      }
+
+      // Update TP values if we found any from orders
+      if(tpValues[0] > 0) m_tradeSetups[s].tp1 = tpValues[0];
+      if(tpValues[1] > 0) m_tradeSetups[s].tp2 = tpValues[1];
+
+      // Check if breakeven already activated by examining positions
+      for(int p = 0; p < totalPositions; p++)
+      {
+         ulong pTicket = PositionGetTicket(p);
+         if(pTicket > 0)
+         {
+            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
+               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
+            {
+               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               double currentSL = PositionGetDouble(POSITION_SL);
+
+               // Check if SL is at or very close to entry (within 1 pip tolerance)
+               if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
+               {
+                  m_tradeSetups[s].beActivated = true;
+                  break;
+               }
+            }
+         }
+      }
+
+      if(tpValues[0] > 0 || tpValues[1] > 0)
+      {
+         Print("  Updated Setup #", s+1, ": ", m_tradeSetups[s].symbol,
+               " TP1=", DoubleToString(m_tradeSetups[s].tp1, 5),
+               " TP2=", DoubleToString(m_tradeSetups[s].tp2, 5));
+      }
+   }
+
+   // Save updated setups back to disk if any were updated
+   if(m_setupCount > 0)
+      SaveSetupsToDisk();
+
+   // Array to track which magic numbers we've already added (from disk or orders/positions)
    ulong processedMagicNumbers[];
    int processedCount = 0;
 
-   // Scan all positions to find TradeUtility positions
+   // Mark all magic numbers loaded from disk as already processed
+   for(int i = 0; i < m_setupCount; i++)
+   {
+      ArrayResize(processedMagicNumbers, processedCount + 1);
+      processedMagicNumbers[processedCount] = m_tradeSetups[i].magicNumber;
+      processedCount++;
+   }
+
+   // PART 1: Scan all PENDING ORDERS to find TradeUtility orders
+   for(int i = 0; i < totalOrders; i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0)
+      {
+         string orderComment = OrderGetString(ORDER_COMMENT);
+         ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
+         double orderTP = OrderGetDouble(ORDER_TP);
+         string orderSymbol = OrderGetString(ORDER_SYMBOL);
+
+         // Check if this is a TradeUtility order by comment
+         if(StringFind(orderComment, "TradeUtility") < 0)
+            continue;  // Not a TradeUtility order
+
+         // Check if we already processed this magic number
+         bool alreadyProcessed = false;
+         for(int j = 0; j < processedCount; j++)
+         {
+            if(processedMagicNumbers[j] == orderMagic)
+            {
+               alreadyProcessed = true;
+               break;
+            }
+         }
+
+         if(!alreadyProcessed)
+         {
+            // Try to decode additional setup data from comment (may be truncated)
+            string commentSymbol;
+            ulong commentMagic;
+            double tp1, tp2;
+            string beMode;
+
+            // Decode what we can from the comment
+            bool decoded = DecodeSetupFromComment(orderComment, commentSymbol, commentMagic, tp1, tp2, beMode);
+
+            // Collect TP values from ALL orders with this magic number
+            double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
+            int tpIndex = 0;
+
+            for(int j = 0; j < totalOrders; j++)
+            {
+               ulong scanTicket = OrderGetTicket(j);
+               if(scanTicket > 0)
+               {
+                  if(OrderGetString(ORDER_SYMBOL) == orderSymbol &&
+                     OrderGetInteger(ORDER_MAGIC) == orderMagic)
+                  {
+                     double orderTP = OrderGetDouble(ORDER_TP);
+                     if(orderTP > 0 && tpIndex < 4)
+                     {
+                        tpValues[tpIndex] = orderTP;
+                        tpIndex++;
+                     }
+                  }
+               }
+            }
+
+            // Create setup using ACTUAL order properties
+            TradeSetup newSetup;
+            newSetup.symbol = orderSymbol;  // Use actual order symbol
+            newSetup.magicNumber = orderMagic;  // Use actual order magic (not truncated)
+            newSetup.tp1 = tpValues[0];  // Use TP from first order with this magic
+            newSetup.tp2 = tpValues[1];  // Use TP from second order with this magic
+            newSetup.beMode = decoded ? beMode : "Disabled";  // Use decoded BE mode if available
+            newSetup.beActivated = false;  // Pending orders can't have BE activated yet
+
+            ArrayResize(m_tradeSetups, m_setupCount + 1);
+            m_tradeSetups[m_setupCount] = newSetup;
+            m_setupCount++;
+
+            // Mark as processed (using ACTUAL magic number)
+            ArrayResize(processedMagicNumbers, processedCount + 1);
+            processedMagicNumbers[processedCount] = orderMagic;
+            processedCount++;
+
+            Print("  Setup #", m_setupCount, " RECONSTRUCTED (from PENDING ORDER):");
+            Print("    Symbol: ", orderSymbol);
+            Print("    Magic Number: ", orderMagic, " (from order properties)");
+            Print("    TP1: ", DoubleToString(newSetup.tp1, 5), (newSetup.tp1 > 0 ? " (from ORDER_TP)" : " (no TP set)"));
+            Print("    TP2: ", DoubleToString(newSetup.tp2, 5), (newSetup.tp2 > 0 ? " (from ORDER_TP)" : " (no TP set)"));
+            Print("    Breakeven Mode: ", beMode, decoded ? " (from comment)" : " (default)");
+            Print("    Status: Pending (not yet filled)");
+            Print("    ---");
+         }
+      }
+   }
+
+   // PART 2: Scan all OPEN POSITIONS to find TradeUtility positions
    for(int i = 0; i < totalPositions; i++)
    {
       ulong ticket = PositionGetTicket(i);
@@ -979,20 +1182,36 @@ void CTradeUtilityDialog::ReconstructSetups()
                processedMagicNumbers[processedCount] = magicNumber;
                processedCount++;
 
-               Print("Reconstructed setup: Symbol=", symbol, " Magic=", magicNumber,
-                     " TP1=", tp1, " TP2=", tp2, " BE=", beMode,
-                     " Activated=", newSetup.beActivated);
+               Print("  Setup #", m_setupCount, " RECONSTRUCTED (from OPEN POSITION):");
+               Print("    Symbol: ", symbol);
+               Print("    Magic Number: ", magicNumber);
+               Print("    TP1: ", DoubleToString(tp1, 5));
+               Print("    TP2: ", DoubleToString(tp2, 5));
+               Print("    Breakeven Mode: ", beMode);
+               Print("    Breakeven Activated: ", (newSetup.beActivated ? "YES" : "NO"));
+               Print("    ---");
             }
          }
       }
    }
 
+   Print("========================================");
    if(m_setupCount > 0)
-      Print("Successfully reconstructed ", m_setupCount, " trade setup(s) from existing positions");
+   {
+      Print("RECONSTRUCTION COMPLETE");
+      Print("Total setups being monitored: ", m_setupCount);
+      Print("Persistent monitoring is ACTIVE");
+   }
+   else
+   {
+      Print("No TradeUtility orders or positions found");
+      Print("No active monitoring setups");
+   }
+   Print("========================================");
 }
 
 //+------------------------------------------------------------------+
-//| Remove setups that no longer have any open positions             |
+//| Remove setups that no longer have pending orders or positions   |
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::CleanupCompletedSetups()
 {
@@ -1000,12 +1219,30 @@ void CTradeUtilityDialog::CleanupCompletedSetups()
       return;
 
    int totalPositions = PositionsTotal();
+   int totalOrders = OrdersTotal();
 
-   // Check each setup to see if it still has positions
+   // Check each setup to see if it still has pending orders or positions
    for(int s = m_setupCount - 1; s >= 0; s--)
    {
+      bool hasOrders = false;
       bool hasPositions = false;
 
+      // Check for pending orders
+      for(int i = 0; i < totalOrders; i++)
+      {
+         ulong ticket = OrderGetTicket(i);
+         if(ticket > 0)
+         {
+            if(OrderGetString(ORDER_SYMBOL) == m_tradeSetups[s].symbol &&
+               OrderGetInteger(ORDER_MAGIC) == m_tradeSetups[s].magicNumber)
+            {
+               hasOrders = true;
+               break;
+            }
+         }
+      }
+
+      // Check for open positions
       for(int i = 0; i < totalPositions; i++)
       {
          ulong ticket = PositionGetTicket(i);
@@ -1020,8 +1257,8 @@ void CTradeUtilityDialog::CleanupCompletedSetups()
          }
       }
 
-      // If no positions found, remove this setup
-      if(!hasPositions)
+      // If no orders or positions found, remove this setup
+      if(!hasOrders && !hasPositions)
       {
          Print("Removing completed setup: Symbol=", m_tradeSetups[s].symbol,
                " Magic=", m_tradeSetups[s].magicNumber);
@@ -1034,6 +1271,217 @@ void CTradeUtilityDialog::CleanupCompletedSetups()
 
          m_setupCount--;
          ArrayResize(m_tradeSetups, m_setupCount);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Save trade setups to CSV file for persistence                    |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::SaveSetupsToDisk()
+{
+   int fileHandle = FileOpen(m_persistenceFile, FILE_WRITE|FILE_TXT|FILE_ANSI);
+
+   if(fileHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to open persistence file for writing: ", m_persistenceFile, " Error: ", GetLastError());
+      return;
+   }
+
+   // Write CSV header
+   FileWriteString(fileHandle, "Symbol,MagicNumber,TP1,TP2,BEMode,BEActivated\n");
+
+   // Write each setup
+   for(int i = 0; i < m_setupCount; i++)
+   {
+      string line = m_tradeSetups[i].symbol + ",";
+      line += IntegerToString(m_tradeSetups[i].magicNumber) + ",";
+      line += DoubleToString(m_tradeSetups[i].tp1, 5) + ",";
+      line += DoubleToString(m_tradeSetups[i].tp2, 5) + ",";
+      line += m_tradeSetups[i].beMode + ",";
+      line += IntegerToString(m_tradeSetups[i].beActivated ? 1 : 0) + "\n";
+
+      FileWriteString(fileHandle, line);
+   }
+
+   FileClose(fileHandle);
+   Print("Saved ", m_setupCount, " trade setup(s) to disk: ", m_persistenceFile);
+}
+
+//+------------------------------------------------------------------+
+//| Load trade setups from CSV file                                  |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::LoadSetupsFromDisk()
+{
+   if(!FileIsExist(m_persistenceFile))
+   {
+      Print("No persistence file found - starting fresh");
+      return;
+   }
+
+   int fileHandle = FileOpen(m_persistenceFile, FILE_READ|FILE_TXT|FILE_ANSI);
+
+   if(fileHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to open persistence file for reading: ", m_persistenceFile, " Error: ", GetLastError());
+      return;
+   }
+
+   Print("========================================");
+   Print("LOADING TRADE SETUPS FROM DISK");
+   Print("========================================");
+
+   // Skip header line
+   string header = FileReadString(fileHandle);
+
+   // Clear existing setups
+   ArrayResize(m_tradeSetups, 0);
+   m_setupCount = 0;
+
+   // Read each line
+   while(!FileIsEnding(fileHandle))
+   {
+      string line = FileReadString(fileHandle);
+
+      if(StringLen(line) == 0)
+         continue;  // Skip empty lines
+
+      // Parse CSV line
+      string fields[];
+      int fieldCount = StringSplit(line, ',', fields);
+
+      if(fieldCount < 6)
+      {
+         Print("WARNING: Skipping invalid line in persistence file: ", line);
+         continue;
+      }
+
+      // Create setup from parsed data
+      TradeSetup setup;
+      setup.symbol = fields[0];
+      setup.magicNumber = (ulong)StringToInteger(fields[1]);
+      setup.tp1 = StringToDouble(fields[2]);
+      setup.tp2 = StringToDouble(fields[3]);
+      setup.beMode = fields[4];
+      setup.beActivated = (StringToInteger(fields[5]) == 1);
+
+      // Add to array
+      ArrayResize(m_tradeSetups, m_setupCount + 1);
+      m_tradeSetups[m_setupCount] = setup;
+      m_setupCount++;
+
+      Print("  Setup #", m_setupCount, " LOADED FROM DISK:");
+      Print("    Symbol: ", setup.symbol);
+      Print("    Magic Number: ", setup.magicNumber);
+      Print("    TP1: ", DoubleToString(setup.tp1, 5));
+      Print("    TP2: ", DoubleToString(setup.tp2, 5));
+      Print("    Breakeven Mode: ", setup.beMode);
+      Print("    Breakeven Activated: ", (setup.beActivated ? "YES" : "NO"));
+      Print("    ---");
+   }
+
+   FileClose(fileHandle);
+
+   Print("========================================");
+   if(m_setupCount > 0)
+   {
+      Print("LOAD COMPLETE");
+      Print("Total setups loaded from disk: ", m_setupCount);
+   }
+   else
+   {
+      Print("No setups found in persistence file");
+   }
+   Print("========================================");
+}
+
+//+------------------------------------------------------------------+
+//| Refresh setup TP values from current orders/positions           |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::RefreshSetupsFromOrders()
+{
+   if(m_setupCount == 0)
+      return;
+
+   int totalPositions = PositionsTotal();
+   int totalOrders = OrdersTotal();
+
+   // Update each setup with fresh data from orders/positions
+   for(int s = 0; s < m_setupCount; s++)
+   {
+      // Collect TP values from ALL orders with this magic number
+      double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
+      int tpIndex = 0;
+
+      for(int j = 0; j < totalOrders; j++)
+      {
+         ulong ticket = OrderGetTicket(j);
+         if(ticket > 0)
+         {
+            if(OrderGetString(ORDER_SYMBOL) == m_tradeSetups[s].symbol &&
+               OrderGetInteger(ORDER_MAGIC) == m_tradeSetups[s].magicNumber)
+            {
+               double orderTP = OrderGetDouble(ORDER_TP);
+               if(orderTP > 0 && tpIndex < 4)
+               {
+                  tpValues[tpIndex] = orderTP;
+                  tpIndex++;
+               }
+            }
+         }
+      }
+
+      // Update TP values if we found any from orders
+      if(tpValues[0] > 0) m_tradeSetups[s].tp1 = tpValues[0];
+      if(tpValues[1] > 0) m_tradeSetups[s].tp2 = tpValues[1];
+
+      // Check if breakeven already activated by examining positions
+      for(int p = 0; p < totalPositions; p++)
+      {
+         ulong pTicket = PositionGetTicket(p);
+         if(pTicket > 0)
+         {
+            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
+               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
+            {
+               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               double currentSL = PositionGetDouble(POSITION_SL);
+
+               // Check if SL is at or very close to entry (within 1 pip tolerance)
+               if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
+               {
+                  m_tradeSetups[s].beActivated = true;
+                  break;
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Periodic save (called from timer)                                |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::PeriodicSave()
+{
+   // Skip if auto-save is disabled (interval set to 0)
+   if(m_saveIntervalSeconds <= 0)
+      return;
+
+   datetime currentTime = TimeCurrent();
+
+   // Check if enough time has passed since last save
+   if(currentTime - m_lastSaveTime >= m_saveIntervalSeconds)
+   {
+      if(m_setupCount > 0)
+      {
+         // Refresh TP values from orders before saving
+         RefreshSetupsFromOrders();
+
+         // Save to disk
+         SaveSetupsToDisk();
+
+         m_lastSaveTime = currentTime;
       }
    }
 }
@@ -1112,6 +1560,9 @@ void CTradeUtilityDialog::OnClickBuy()
    ArrayResize(m_tradeSetups, m_setupCount + 1);
    m_tradeSetups[m_setupCount] = newSetup;
    m_setupCount++;
+
+   // Save to disk immediately after adding new setup
+   SaveSetupsToDisk();
 
    // Set magic number for CTrade
    trade.SetExpertMagicNumber(magicNumber);
@@ -1207,6 +1658,9 @@ void CTradeUtilityDialog::OnClickSell()
    ArrayResize(m_tradeSetups, m_setupCount + 1);
    m_tradeSetups[m_setupCount] = newSetup;
    m_setupCount++;
+
+   // Save to disk immediately after adding new setup
+   SaveSetupsToDisk();
 
    // Set magic number for CTrade
    trade.SetExpertMagicNumber(magicNumber);
@@ -1458,6 +1912,9 @@ void CTradeUtilityDialog::ProcessBreakeven()
          {
             m_tradeSetups[s].beActivated = true;
             Print("Breakeven activated for setup #", s+1, " [", m_tradeSetups[s].symbol, "]. ", movedCount, " position(s) moved to breakeven (", m_tradeSetups[s].beMode, ", Magic: ", m_tradeSetups[s].magicNumber, ")");
+
+            // Save to disk after breakeven activation
+            SaveSetupsToDisk();
          }
       }
    }
@@ -1593,6 +2050,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // Save setups to disk before shutdown
+   AppWindow.SaveSetupsToDisk();
+
    // Kill the timer
    EventKillTimer();
 
@@ -1618,6 +2078,9 @@ void OnTimer()
 
    // Periodically cleanup completed setups (positions that were closed)
    AppWindow.CleanupCompletedSetups();
+
+   // Periodic save (every 30 seconds by default)
+   AppWindow.PeriodicSave();
 }
 
 //+------------------------------------------------------------------+
