@@ -15,6 +15,11 @@
 #include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
+//| Input Parameters                                                  |
+//+------------------------------------------------------------------+
+input int FontSize = 10;  // Font size for all UI elements
+
+//+------------------------------------------------------------------+
 //| Custom Dialog Class                                              |
 //+------------------------------------------------------------------+
 class CTradeUtilityDialog : public CAppDialog
@@ -66,6 +71,7 @@ private:
    // Internal variables
    bool              m_isMarketOrder;
    int               m_orderCount;
+   int               m_fontSize;
 
    // Breakeven tracking structures
    struct TradeSetup
@@ -85,6 +91,7 @@ public:
                      CTradeUtilityDialog();
                     ~CTradeUtilityDialog();
    virtual bool      Create(const long chart, const string name, const int subwin, const int x1, const int y1, const int x2, const int y2);
+   void              SetFontSize(int fontSize) { m_fontSize = fontSize; }
    virtual void      OnTick();
 
 protected:
@@ -104,6 +111,7 @@ protected:
    bool              ValidatePendingPrice(bool isBuy, double entryPrice);
    double            GetMinLot();
    ulong             GetMagicNumberForSymbol(string symbol);
+   void              SetComboBoxFontSize(CComboBox &combobox, int fontSize);
    virtual bool      OnEvent(const int id, const long &lparam, const double &dparam, const string &sparam);
 };
 
@@ -114,6 +122,7 @@ CTradeUtilityDialog::CTradeUtilityDialog()
 {
    m_isMarketOrder = true;
    m_orderCount = 1;
+   m_fontSize = 10;
    m_setupCount = 0;
    ArrayResize(m_tradeSetups, 0);
 }
@@ -122,8 +131,23 @@ CTradeUtilityDialog::CTradeUtilityDialog()
 //| Destructor                                                        |
 //+------------------------------------------------------------------+
 CTradeUtilityDialog::~CTradeUtilityDialog()
-{
-}
+  {
+  }
+
+//+------------------------------------------------------------------+
+//| Set font size for ComboBox internal objects                      |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::SetComboBoxFontSize(CComboBox &combobox, int fontSize)
+  {
+   string combobox_name = combobox.Name();
+   
+   // Set font size for the Edit control (main text field)
+   string edit_name = combobox_name + "Edit";
+   ObjectSetInteger(m_chart_id, edit_name, OBJPROP_FONTSIZE, fontSize);
+   
+   // Note: The dropdown button (BmpButton) and ListView don't support font size changes
+   // as they use bitmap images and have their own internal structure
+  }
 
 //+------------------------------------------------------------------+
 //| Create                                                            |
@@ -157,6 +181,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblSymbol.Create(m_chart_id, m_name+"LblSymbol", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblSymbol.Text("Symbol:");
+   m_lblSymbol.FontSize(m_fontSize);
    if(!Add(m_lblSymbol))
       return false;
 
@@ -164,6 +189,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_edtSymbol.ReadOnly(true);
    m_edtSymbol.ColorBackground(C'240,240,240');
+   m_edtSymbol.FontSize(m_fontSize);
    if(!Add(m_edtSymbol))
       return false;
 
@@ -173,6 +199,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblMinLot.Create(m_chart_id, m_name+"LblMinLot", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblMinLot.Text("Min. Allowed Lot:");
+   m_lblMinLot.FontSize(m_fontSize);
    if(!Add(m_lblMinLot))
       return false;
 
@@ -180,6 +207,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_edtMinLot.ReadOnly(true);
    m_edtMinLot.ColorBackground(C'240,240,240');
+   m_edtMinLot.FontSize(m_fontSize);
    if(!Add(m_edtMinLot))
       return false;
 
@@ -189,6 +217,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblRiskPercent.Create(m_chart_id, m_name+"LblRiskPercent", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblRiskPercent.Text("Risk % of Balance:");
+   m_lblRiskPercent.FontSize(m_fontSize);
    if(!Add(m_lblRiskPercent))
       return false;
 
@@ -196,6 +225,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_edtRiskPercent.Text("1.0");
    m_edtRiskPercent.ReadOnly(false);
+   m_edtRiskPercent.FontSize(m_fontSize);
    if(!Add(m_edtRiskPercent))
       return false;
 
@@ -205,6 +235,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblOrderType.Create(m_chart_id, m_name+"LblOrderType", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblOrderType.Text("Order Type:");
+   m_lblOrderType.FontSize(m_fontSize);
    if(!Add(m_lblOrderType))
       return false;
 
@@ -213,6 +244,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_cmbOrderType.ItemAdd("MARKET");
    m_cmbOrderType.ItemAdd("PENDING");
    m_cmbOrderType.Select(0);
+   SetComboBoxFontSize(m_cmbOrderType, m_fontSize);
    if(!Add(m_cmbOrderType))
       return false;
 
@@ -222,12 +254,14 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblEntryPrice.Create(m_chart_id, m_name+"LblEntryPrice", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblEntryPrice.Text("Entry Price:");
+   m_lblEntryPrice.FontSize(m_fontSize);
    if(!Add(m_lblEntryPrice))
       return false;
 
    if(!m_edtEntryPrice.Create(m_chart_id, m_name+"EdtEntryPrice", m_subwin, x3, y, x4, y+20))
       return false;
    m_edtEntryPrice.Text("0.00000");
+   m_edtEntryPrice.FontSize(m_fontSize);
    if(!Add(m_edtEntryPrice))
       return false;
 
@@ -237,6 +271,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblOrderCount.Create(m_chart_id, m_name+"LblOrderCount", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblOrderCount.Text("Order Count:");
+   m_lblOrderCount.FontSize(m_fontSize);
    if(!Add(m_lblOrderCount))
       return false;
 
@@ -247,6 +282,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_cmbOrderCount.ItemAdd("3");
    m_cmbOrderCount.ItemAdd("4");
    m_cmbOrderCount.Select(0);
+   SetComboBoxFontSize(m_cmbOrderCount, m_fontSize);
    if(!Add(m_cmbOrderCount))
       return false;
 
@@ -256,6 +292,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblLotSize.Create(m_chart_id, m_name+"LblLotSize", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblLotSize.Text("Lot Size:");
+   m_lblLotSize.FontSize(m_fontSize);
    if(!Add(m_lblLotSize))
       return false;
 
@@ -264,6 +301,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_edtLotSize.ReadOnly(true);
    m_edtLotSize.ColorBackground(C'240,240,240');
    m_edtLotSize.Text("0.00");
+   m_edtLotSize.FontSize(m_fontSize);
    if(!Add(m_edtLotSize))
       return false;
 
@@ -273,6 +311,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblSL.Create(m_chart_id, m_name+"LblSL", m_subwin, x1, y, x1+30, y+20))
       return false;
    m_lblSL.Text("SL");
+   m_lblSL.FontSize(m_fontSize);
    if(!Add(m_lblSL))
       return false;
 
@@ -280,6 +319,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_lblSLValue.Text("$0.00");
    m_lblSLValue.Color(clrRed);
+   m_lblSLValue.FontSize(m_fontSize);
    if(!Add(m_lblSLValue))
       return false;
 
@@ -287,6 +327,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_edtSL.Text("0.00");
    m_edtSL.Color(clrRed);
+   m_edtSL.FontSize(m_fontSize);
    if(!Add(m_edtSL))
       return false;
 
@@ -296,6 +337,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblTP1.Create(m_chart_id, m_name+"LblTP1", m_subwin, x1, y, x1+30, y+20))
       return false;
    m_lblTP1.Text("TP1");
+   m_lblTP1.FontSize(m_fontSize);
    if(!Add(m_lblTP1))
       return false;
 
@@ -303,6 +345,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_lblTP1Value.Text("$0.00");
    m_lblTP1Value.Color(clrGreen);
+   m_lblTP1Value.FontSize(m_fontSize);
    if(!Add(m_lblTP1Value))
       return false;
 
@@ -310,6 +353,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_edtTP1.Text("0.00");
    m_edtTP1.Color(clrGreen);
+   m_edtTP1.FontSize(m_fontSize);
    if(!Add(m_edtTP1))
       return false;
 
@@ -319,6 +363,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblTP2.Create(m_chart_id, m_name+"LblTP2", m_subwin, x1, y, x1+30, y+20))
       return false;
    m_lblTP2.Text("TP2");
+   m_lblTP2.FontSize(m_fontSize);
    if(!Add(m_lblTP2))
       return false;
 
@@ -326,6 +371,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_lblTP2Value.Text("$0.00");
    m_lblTP2Value.Color(clrGreen);
+   m_lblTP2Value.FontSize(m_fontSize);
    if(!Add(m_lblTP2Value))
       return false;
 
@@ -335,6 +381,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_edtTP2.Color(clrGreen);
    m_edtTP2.ReadOnly(true);
    m_edtTP2.ColorBackground(C'240,240,240');
+   m_edtTP2.FontSize(m_fontSize);
    if(!Add(m_edtTP2))
       return false;
 
@@ -344,6 +391,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblTP3.Create(m_chart_id, m_name+"LblTP3", m_subwin, x1, y, x1+30, y+20))
       return false;
    m_lblTP3.Text("TP3");
+   m_lblTP3.FontSize(m_fontSize);
    if(!Add(m_lblTP3))
       return false;
 
@@ -351,6 +399,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_lblTP3Value.Text("$0.00");
    m_lblTP3Value.Color(clrGreen);
+   m_lblTP3Value.FontSize(m_fontSize);
    if(!Add(m_lblTP3Value))
       return false;
 
@@ -360,6 +409,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_edtTP3.Color(clrGreen);
    m_edtTP3.ReadOnly(true);
    m_edtTP3.ColorBackground(C'240,240,240');
+   m_edtTP3.FontSize(m_fontSize);
    if(!Add(m_edtTP3))
       return false;
 
@@ -369,6 +419,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblTP4.Create(m_chart_id, m_name+"LblTP4", m_subwin, x1, y, x1+30, y+20))
       return false;
    m_lblTP4.Text("TP4");
+   m_lblTP4.FontSize(m_fontSize);
    if(!Add(m_lblTP4))
       return false;
 
@@ -376,6 +427,7 @@ bool CTradeUtilityDialog::CreateControls()
       return false;
    m_lblTP4Value.Text("$0.00");
    m_lblTP4Value.Color(clrGreen);
+   m_lblTP4Value.FontSize(m_fontSize);
    if(!Add(m_lblTP4Value))
       return false;
 
@@ -385,6 +437,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_edtTP4.Color(clrGreen);
    m_edtTP4.ReadOnly(true);
    m_edtTP4.ColorBackground(C'240,240,240');
+   m_edtTP4.FontSize(m_fontSize);
    if(!Add(m_edtTP4))
       return false;
 
@@ -394,6 +447,7 @@ bool CTradeUtilityDialog::CreateControls()
    if(!m_lblBreakeven.Create(m_chart_id, m_name+"LblBreakeven", m_subwin, x1, y, x2, y+20))
       return false;
    m_lblBreakeven.Text("Breakeven:");
+   m_lblBreakeven.FontSize(m_fontSize);
    if(!Add(m_lblBreakeven))
       return false;
 
@@ -403,6 +457,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_cmbBreakeven.ItemAdd("After TP1");
    m_cmbBreakeven.ItemAdd("After TP2");
    m_cmbBreakeven.Select(0);
+   SetComboBoxFontSize(m_cmbBreakeven, m_fontSize);
    if(!Add(m_cmbBreakeven))
       return false;
 
@@ -414,6 +469,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_btnBuy.Text("BUY NOW");
    m_btnBuy.ColorBackground(clrDodgerBlue);
    m_btnBuy.Color(clrWhite);
+   m_btnBuy.FontSize(m_fontSize);
    if(!Add(m_btnBuy))
       return false;
 
@@ -423,6 +479,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_btnSell.Text("SELL NOW");
    m_btnSell.ColorBackground(clrCrimson);
    m_btnSell.Color(clrWhite);
+   m_btnSell.FontSize(m_fontSize);
    if(!Add(m_btnSell))
       return false;
 
@@ -434,6 +491,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_btnCancelAll.Text("Cancel All Orders");
    m_btnCancelAll.ColorBackground(C'192,192,192');
    m_btnCancelAll.Color(clrBlack);
+   m_btnCancelAll.FontSize(m_fontSize);
    if(!Add(m_btnCancelAll))
       return false;
 
@@ -443,6 +501,7 @@ bool CTradeUtilityDialog::CreateControls()
    m_btnCloseAll.Text("Close All Positions");
    m_btnCloseAll.ColorBackground(C'192,192,192');
    m_btnCloseAll.Color(clrBlack);
+   m_btnCloseAll.FontSize(m_fontSize);
    if(!Add(m_btnCloseAll))
       return false;
 
@@ -1267,6 +1326,9 @@ CTradeUtilityDialog AppWindow;
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   // Set font size from input parameter
+   AppWindow.SetFontSize(FontSize);
+   
    // Create the panel (increased height to accommodate all controls)
    if(!AppWindow.Create(0, "Trade Utility Panel", 0, 20, 20, 380, 580))
       return(INIT_FAILED);
