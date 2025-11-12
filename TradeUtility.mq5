@@ -74,6 +74,19 @@ private:
    int               m_orderCount;
    int               m_fontSize;
 
+   // Symbol change detection and input preservation
+   string            m_currentSymbol;
+   string            m_savedRiskPercent;
+   string            m_savedOrderType;
+   string            m_savedEntryPrice;
+   string            m_savedOrderCount;
+   string            m_savedSL;
+   string            m_savedTP1;
+   string            m_savedTP2;
+   string            m_savedTP3;
+   string            m_savedTP4;
+   string            m_savedBreakeven;
+
    // Breakeven tracking structures
    struct TradeSetup
    {
@@ -88,6 +101,7 @@ private:
    TradeSetup        m_tradeSetups[];
    int               m_setupCount;
    string            m_persistenceFile;
+   string            m_inputsFile;
    datetime          m_lastSaveTime;
    int               m_saveIntervalSeconds;
 
@@ -103,6 +117,10 @@ public:
    void              LoadSetupsFromDisk();
    void              RefreshSetupsFromOrders();
    void              PeriodicSave();
+   void              SaveInputValues();
+   void              RestoreInputValues();
+   void              SaveInputsToDisk();
+   void              LoadInputsFromDisk();
 
 protected:
    virtual bool      CreateControls();
@@ -136,8 +154,22 @@ CTradeUtilityDialog::CTradeUtilityDialog()
    m_setupCount = 0;
    ArrayResize(m_tradeSetups, 0);
    m_persistenceFile = "TradeUtility_Setups.csv";
+   m_inputsFile = "TradeUtility_Inputs.csv";
    m_lastSaveTime = 0;
    m_saveIntervalSeconds = AutoSaveIntervalSeconds;  // From input parameter
+   
+   // Initialize symbol tracking (defaults - will be loaded from disk if available)
+   m_currentSymbol = _Symbol;
+   m_savedRiskPercent = "1.0";
+   m_savedOrderType = "MARKET";
+   m_savedEntryPrice = "0.00000";
+   m_savedOrderCount = "2";
+   m_savedSL = "0.00";
+   m_savedTP1 = "0.00";
+   m_savedTP2 = "0.00";
+   m_savedTP3 = "0.00";
+   m_savedTP4 = "0.00";
+   m_savedBreakeven = "After TP1";
 }
 
 //+------------------------------------------------------------------+
@@ -174,6 +206,13 @@ bool CTradeUtilityDialog::Create(const long chart, const string name, const int 
       return false;
 
    UpdateSymbolInfo();
+   
+   // Load saved inputs from disk for current symbol
+   LoadInputsFromDisk();
+   
+   // Restore the loaded values to UI
+   RestoreInputValues();
+   
    UpdateButtonLabels();
    UpdateTPFields();
 
@@ -619,7 +658,13 @@ void CTradeUtilityDialog::OnChangeOrderType()
       // Pending order - user can input price
       m_edtEntryPrice.ReadOnly(false);
       m_edtEntryPrice.ColorBackground(clrWhite);
-      m_edtEntryPrice.Text("0.00000");
+      // Don't reset Entry Price - preserve existing value (important for restoring saved inputs)
+      // Only reset if it's truly empty/invalid
+      string currentEntryPrice = m_edtEntryPrice.Text();
+      if(StringLen(currentEntryPrice) == 0)
+      {
+         m_edtEntryPrice.Text("0.00000");
+      }
    }
 
    UpdateButtonLabels();
@@ -645,6 +690,9 @@ void CTradeUtilityDialog::CalculateLotSize()
    double riskPercent = StringToDouble(m_edtRiskPercent.Text());
    double riskAmount = balance * riskPercent / 100.0;
 
+   // Divide risk amount by order count (so total risk is split across all orders)
+   double riskPerOrder = riskAmount / m_orderCount;
+
    // Get SL and entry prices
    double slPrice = StringToDouble(m_edtSL.Text());
    double entryPrice = StringToDouble(m_edtEntryPrice.Text());
@@ -655,7 +703,7 @@ void CTradeUtilityDialog::CalculateLotSize()
    // If SL is not set, use fixed ratio: minimum allowed lot per $1000 balance
    if(slPrice == 0)
    {
-      lotSize = balance / 1000.0 * minLot;
+      lotSize = balance / 1000.0 * minLot / m_orderCount;
    }
    else if(entryPrice == 0)
    {
@@ -670,7 +718,7 @@ void CTradeUtilityDialog::CalculateLotSize()
       if(slDistance == 0)
       {
          // SL is same as entry, use minimum allowed lot per $1000 ratio
-         lotSize = balance / 1000.0 * minLot;
+         lotSize = balance / 1000.0 * minLot / m_orderCount;
       }
       else
       {
@@ -678,8 +726,8 @@ void CTradeUtilityDialog::CalculateLotSize()
          double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
          double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
 
-         // Calculate lot size based on risk
-         lotSize = riskAmount / (slDistance / tickSize * tickValue);
+         // Calculate lot size based on risk per order
+         lotSize = riskPerOrder / (slDistance / tickSize * tickValue);
       }
    }
 
@@ -717,12 +765,12 @@ void CTradeUtilityDialog::UpdateDollarValues()
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
 
-   // Calculate SL dollar value
+   // Calculate SL dollar value (TOTAL across all orders)
    double slPrice = StringToDouble(m_edtSL.Text());
    if(slPrice != 0)
    {
       double slDistance = MathAbs(entryPrice - slPrice);
-      double slDollar = (slDistance / tickSize) * tickValue * lotSize;
+      double slDollar = (slDistance / tickSize) * tickValue * lotSize * m_orderCount;
       m_lblSLValue.Text("$" + DoubleToString(slDollar, 2));
    }
    else
@@ -1851,10 +1899,252 @@ void CTradeUtilityDialog::ProcessBreakeven()
 }
 
 //+------------------------------------------------------------------+
+//| Save current input values to memory                              |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::SaveInputValues()
+{
+   // Use .Text() method consistently for all input fields
+   m_savedRiskPercent = m_edtRiskPercent.Text();
+   m_savedOrderType = m_cmbOrderType.Select();
+   m_savedEntryPrice = m_edtEntryPrice.Text();
+   m_savedOrderCount = m_cmbOrderCount.Select();
+   m_savedSL = m_edtSL.Text();
+   m_savedTP1 = m_edtTP1.Text();
+   m_savedTP2 = m_edtTP2.Text();
+   m_savedTP3 = m_edtTP3.Text();
+   m_savedTP4 = m_edtTP4.Text();
+   m_savedBreakeven = m_cmbBreakeven.Select();
+   
+   // Save to disk immediately
+   SaveInputsToDisk();
+}
+
+//+------------------------------------------------------------------+
+//| Restore saved input values from memory to UI                     |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::RestoreInputValues()
+{
+   m_edtRiskPercent.Text(m_savedRiskPercent);
+   
+   // Restore order type combo box
+   if(m_savedOrderType == "MARKET")
+      m_cmbOrderType.Select(0);
+   else
+      m_cmbOrderType.Select(1);
+   OnChangeOrderType();
+   
+   // IMPORTANT: Restore Entry Price AFTER OnChangeOrderType() 
+   // OnChangeOrderType() now preserves existing values (only resets empty fields)
+   m_edtEntryPrice.Text(m_savedEntryPrice);
+   
+   // Restore order count combo box
+   if(m_savedOrderCount == "1")
+      m_cmbOrderCount.Select(0);
+   else if(m_savedOrderCount == "2")
+      m_cmbOrderCount.Select(1);
+   else if(m_savedOrderCount == "3")
+      m_cmbOrderCount.Select(2);
+   else if(m_savedOrderCount == "4")
+      m_cmbOrderCount.Select(3);
+   OnChangeOrderCount();
+   
+   m_edtSL.Text(m_savedSL);
+   m_edtTP1.Text(m_savedTP1);
+   m_edtTP2.Text(m_savedTP2);
+   m_edtTP3.Text(m_savedTP3);
+   m_edtTP4.Text(m_savedTP4);
+   
+   // Restore breakeven combo box
+   if(m_savedBreakeven == "Disabled")
+      m_cmbBreakeven.Select(0);
+   else if(m_savedBreakeven == "After TP1")
+      m_cmbBreakeven.Select(1);
+   else if(m_savedBreakeven == "After TP2")
+      m_cmbBreakeven.Select(2);
+   
+   // Recalculate lot size and dollar values after restoring
+   CalculateLotSize();
+   UpdateDollarValues();
+}
+
+//+------------------------------------------------------------------+
+//| Save input values to disk (per symbol)                           |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::SaveInputsToDisk()
+{
+   // Read existing file and update only current symbol's entry
+   string lines[];
+   int lineCount = 0;
+   bool symbolFound = false;
+   
+   // Read existing file if it exists
+   if(FileIsExist(m_inputsFile))
+   {
+      int fileHandle = FileOpen(m_inputsFile, FILE_READ|FILE_TXT|FILE_ANSI);
+      if(fileHandle != INVALID_HANDLE)
+      {
+         // Read header
+         if(!FileIsEnding(fileHandle))
+         {
+            ArrayResize(lines, lineCount + 1);
+            lines[lineCount] = FileReadString(fileHandle);
+            lineCount++;
+         }
+         
+         // Read all data lines
+         while(!FileIsEnding(fileHandle))
+         {
+            string line = FileReadString(fileHandle);
+            if(StringLen(line) > 0)
+            {
+               string fields[];
+               int fieldCount = StringSplit(line, ',', fields);
+               
+               if(fieldCount > 0 && fields[0] == m_currentSymbol)
+               {
+                  // Update this symbol's line
+                  string newLine = m_currentSymbol + ",";
+                  newLine += m_savedRiskPercent + ",";
+                  newLine += m_savedOrderType + ",";
+                  newLine += m_savedEntryPrice + ",";
+                  newLine += m_savedOrderCount + ",";
+                  newLine += m_savedSL + ",";
+                  newLine += m_savedTP1 + ",";
+                  newLine += m_savedTP2 + ",";
+                  newLine += m_savedTP3 + ",";
+                  newLine += m_savedTP4 + ",";
+                  newLine += m_savedBreakeven;
+                  
+                  ArrayResize(lines, lineCount + 1);
+                  lines[lineCount] = newLine;
+                  lineCount++;
+                  symbolFound = true;
+               }
+               else
+               {
+                  // Keep other symbol's lines
+                  ArrayResize(lines, lineCount + 1);
+                  lines[lineCount] = line;
+                  lineCount++;
+               }
+            }
+         }
+         FileClose(fileHandle);
+      }
+   }
+   else
+   {
+      // Create new file with header
+      ArrayResize(lines, 1);
+      lines[0] = "Symbol,RiskPercent,OrderType,EntryPrice,OrderCount,SL,TP1,TP2,TP3,TP4,Breakeven";
+      lineCount = 1;
+   }
+   
+   // If symbol not found, add new line
+   if(!symbolFound)
+   {
+      string newLine = m_currentSymbol + ",";
+      newLine += m_savedRiskPercent + ",";
+      newLine += m_savedOrderType + ",";
+      newLine += m_savedEntryPrice + ",";
+      newLine += m_savedOrderCount + ",";
+      newLine += m_savedSL + ",";
+      newLine += m_savedTP1 + ",";
+      newLine += m_savedTP2 + ",";
+      newLine += m_savedTP3 + ",";
+      newLine += m_savedTP4 + ",";
+      newLine += m_savedBreakeven;
+      
+      ArrayResize(lines, lineCount + 1);
+      lines[lineCount] = newLine;
+      lineCount++;
+   }
+   
+   // Write all lines back to file
+   int fileHandle = FileOpen(m_inputsFile, FILE_WRITE|FILE_TXT|FILE_ANSI);
+   if(fileHandle != INVALID_HANDLE)
+   {
+      for(int i = 0; i < lineCount; i++)
+      {
+         FileWriteString(fileHandle, lines[i] + "\n");
+      }
+      FileClose(fileHandle);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Load input values from disk (for current symbol)                 |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::LoadInputsFromDisk()
+{
+   if(!FileIsExist(m_inputsFile))
+      return;
+   
+   int fileHandle = FileOpen(m_inputsFile, FILE_READ|FILE_TXT|FILE_ANSI);
+   if(fileHandle == INVALID_HANDLE)
+      return;
+   
+   // Skip header
+   if(!FileIsEnding(fileHandle))
+      FileReadString(fileHandle);
+   
+   // Read all lines and find current symbol
+   while(!FileIsEnding(fileHandle))
+   {
+      string line = FileReadString(fileHandle);
+      if(StringLen(line) == 0)
+         continue;
+      
+      string fields[];
+      int fieldCount = StringSplit(line, ',', fields);
+      
+      if(fieldCount >= 11 && fields[0] == m_currentSymbol)
+      {
+         // Found saved inputs for this symbol
+         m_savedRiskPercent = fields[1];
+         m_savedOrderType = fields[2];
+         m_savedEntryPrice = fields[3];
+         m_savedOrderCount = fields[4];
+         m_savedSL = fields[5];
+         m_savedTP1 = fields[6];
+         m_savedTP2 = fields[7];
+         m_savedTP3 = fields[8];
+         m_savedTP4 = fields[9];
+         m_savedBreakeven = fields[10];
+         break;
+      }
+   }
+   
+   FileClose(fileHandle);
+}
+
+//+------------------------------------------------------------------+
 //| OnTick - Update entry price if market order                      |
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::OnTick()
 {
+   // Detect symbol change
+   if(_Symbol != m_currentSymbol)
+   {
+      Print("Symbol changed from ", m_currentSymbol, " to ", _Symbol);
+      
+      // Update to new symbol
+      m_currentSymbol = _Symbol;
+      
+      // Update symbol info
+      UpdateSymbolInfo();
+      
+      // Load saved inputs from disk for new symbol (if exists)
+      LoadInputsFromDisk();
+      
+      // Restore the loaded values to UI
+      RestoreInputValues();
+      
+      // Recalculate
+      CalculateLotSize();
+      UpdateDollarValues();
+   }
+   
    if(m_isMarketOrder)
    {
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -1909,12 +2199,20 @@ bool CTradeUtilityDialog::OnEvent(const int id, const long &lparam, const double
       if(sparam == m_cmbOrderType.Name())
       {
          OnChangeOrderType();
+         SaveInputValues();  // Save to disk
          return true;
       }
 
       if(sparam == m_cmbOrderCount.Name())
       {
          OnChangeOrderCount();
+         SaveInputValues();  // Save to disk
+         return true;
+      }
+      
+      if(sparam == m_cmbBreakeven.Name())
+      {
+         SaveInputValues();  // Save to disk
          return true;
       }
    }
@@ -1929,6 +2227,7 @@ bool CTradeUtilityDialog::OnEvent(const int id, const long &lparam, const double
       {
          CalculateLotSize();
          UpdateDollarValues();
+         SaveInputValues();  // Save to disk
          return true;
       }
 
@@ -1939,6 +2238,7 @@ bool CTradeUtilityDialog::OnEvent(const int id, const long &lparam, const double
          sparam == m_edtTP4.Name())
       {
          UpdateDollarValues();
+         SaveInputValues();  // Save to disk
          return true;
       }
    }
@@ -1980,6 +2280,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // Save current input values to disk before shutdown (important for timeframe changes)
+   AppWindow.SaveInputValues();
+   
    // Save setups to disk before shutdown
    AppWindow.SaveSetupsToDisk();
 
