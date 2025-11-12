@@ -369,7 +369,7 @@ bool CTradeUtilityDialog::CreateControls()
 
    if(!m_lblSLValue.Create(m_chart_id, m_name+"LblSLValue", m_subwin, x1+35, y, x2, y+20))
       return false;
-   m_lblSLValue.Text("$0.00");
+   m_lblSLValue.Text("$0.00 (Total)");
    m_lblSLValue.Color(clrRed);
    m_lblSLValue.FontSize(m_fontSize);
    if(!Add(m_lblSLValue))
@@ -754,7 +754,7 @@ void CTradeUtilityDialog::UpdateDollarValues()
 
    if(entryPrice == 0 || lotSize == 0)
    {
-      m_lblSLValue.Text("$0.00");
+      m_lblSLValue.Text("$0.00 (Total)");
       m_lblTP1Value.Text("$0.00");
       m_lblTP2Value.Text("$0.00");
       m_lblTP3Value.Text("$0.00");
@@ -771,11 +771,11 @@ void CTradeUtilityDialog::UpdateDollarValues()
    {
       double slDistance = MathAbs(entryPrice - slPrice);
       double slDollar = (slDistance / tickSize) * tickValue * lotSize * m_orderCount;
-      m_lblSLValue.Text("$" + DoubleToString(slDollar, 2));
+      m_lblSLValue.Text("$" + DoubleToString(slDollar, 2) + " (Total)");
    }
    else
    {
-      m_lblSLValue.Text("$0.00");
+      m_lblSLValue.Text("$0.00 (Total)");
    }
 
    // Calculate TP1 dollar value
@@ -2077,6 +2077,18 @@ void CTradeUtilityDialog::SaveInputsToDisk()
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::LoadInputsFromDisk()
 {
+   // Reset to defaults first (important for new symbols with no saved data)
+   m_savedRiskPercent = "1.0";
+   m_savedOrderType = "MARKET";
+   m_savedEntryPrice = "0.00000";
+   m_savedOrderCount = "2";
+   m_savedSL = "0.00";
+   m_savedTP1 = "0.00";
+   m_savedTP2 = "0.00";
+   m_savedTP3 = "0.00";
+   m_savedTP4 = "0.00";
+   m_savedBreakeven = "After TP1";
+   
    if(!FileIsExist(m_inputsFile))
       return;
    
@@ -2100,7 +2112,7 @@ void CTradeUtilityDialog::LoadInputsFromDisk()
       
       if(fieldCount >= 11 && fields[0] == m_currentSymbol)
       {
-         // Found saved inputs for this symbol
+         // Found saved inputs for this symbol - override defaults
          m_savedRiskPercent = fields[1];
          m_savedOrderType = fields[2];
          m_savedEntryPrice = fields[3];
@@ -2128,13 +2140,16 @@ void CTradeUtilityDialog::OnTick()
    {
       Print("Symbol changed from ", m_currentSymbol, " to ", _Symbol);
       
+      // IMPORTANT: Save OLD symbol's inputs before switching
+      SaveInputValues();
+      
       // Update to new symbol
       m_currentSymbol = _Symbol;
       
       // Update symbol info
       UpdateSymbolInfo();
       
-      // Load saved inputs from disk for new symbol (if exists)
+      // Load saved inputs from disk for new symbol (resets to defaults if not found)
       LoadInputsFromDisk();
       
       // Restore the loaded values to UI
