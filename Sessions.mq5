@@ -9,9 +9,9 @@
 #property indicator_chart_window
 #property indicator_plots 0
 
-input color TokyoColor = clrTomato;
-input color LondonColor = clrDodgerBlue;
-input color NewYorkColor = clrDeepPink;
+input color TokyoColor = clrMoccasin;
+input color LondonColor = clrLightPink;
+input color NewYorkColor = clrGainsboro;
 input int DaysBack = 30;
 
 struct SessionTime
@@ -34,21 +34,21 @@ int OnInit()
    sessions[0].name = "Tokyo";
    sessions[0].startHour = 0;
    sessions[0].startMinute = 0;
-   sessions[0].endHour = 9;
+   sessions[0].endHour = 5;
    sessions[0].endMinute = 0;
    sessions[0].clr = TokyoColor;
    
    sessions[1].name = "London";
-   sessions[1].startHour = 8;
+   sessions[1].startHour = 9;
    sessions[1].startMinute = 0;
-   sessions[1].endHour = 17;
+   sessions[1].endHour = 16;
    sessions[1].endMinute = 0;
    sessions[1].clr = LondonColor;
    
    sessions[2].name = "NewYork";
-   sessions[2].startHour = 13;
+   sessions[2].startHour = 15;
    sessions[2].startMinute = 0;
-   sessions[2].endHour = 22;
+   sessions[2].endHour = 20;
    sessions[2].endMinute = 0;
    sessions[2].clr = NewYorkColor;
    
@@ -101,15 +101,15 @@ void DrawSessions()
          double highPrice = 0;
          double lowPrice = DBL_MAX;
          
-         int startBar = iBarShift(_Symbol, PERIOD_CURRENT, sessionStart);
-         int endBar = iBarShift(_Symbol, PERIOD_CURRENT, sessionEnd);
+         int startBar = iBarShift(_Symbol, PERIOD_M1, sessionStart);
+         int endBar = iBarShift(_Symbol, PERIOD_M1, sessionEnd);
          
          if(startBar < 0 || endBar < 0) continue;
          
          for(int bar = endBar; bar <= startBar; bar++)
          {
-            double high = iHigh(_Symbol, PERIOD_CURRENT, bar);
-            double low = iLow(_Symbol, PERIOD_CURRENT, bar);
+            double high = iHigh(_Symbol, PERIOD_M1, bar);
+            double low = iLow(_Symbol, PERIOD_M1, bar);
             
             if(high > highPrice) highPrice = high;
             if(low < lowPrice) lowPrice = low;
