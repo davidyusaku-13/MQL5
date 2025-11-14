@@ -679,6 +679,8 @@ void CTradeUtilityDialog::OnChangeOrderCount()
    m_orderCount = (int)StringToInteger(selectedCount);
 
    UpdateTPFields();
+   CalculateLotSize();
+   UpdateDollarValues();
 }
 
 //+------------------------------------------------------------------+
