@@ -17,6 +17,7 @@ input int      range_start_time = 90;      // Range start time in minutes
 input int      range_duration = 270;       // Range duration in minutes
 input int      range_close_time = 1200;    // Range close time in minutes (-1=off)
 input bool     single_breakout_only = true;  // Allow only one breakout per range (if true: cancel opposite order when one triggers)
+input int      ema_period = 200;             // EMA period for trend confirmation
 input bool     range_on_monday = true;     // Range on Monday
 input bool     range_on_tuesday = true;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
@@ -56,6 +57,9 @@ datetime g_min_range_date = 0;  // Date of minimum range
 // ATR indicator handle
 int atr_handle = INVALID_HANDLE;
 
+// EMA indicator handle for trend confirmation
+int ema_handle = INVALID_HANDLE;
+
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -73,6 +77,14 @@ int OnInit()
    if(atr_handle == INVALID_HANDLE)
    {
       Print("Failed to create ATR indicator");
+      return(INIT_FAILED);
+   }
+
+   // Initialize EMA indicator for trend confirmation
+   ema_handle = iMA(_Symbol, PERIOD_M1, ema_period, 0, MODE_EMA, PRICE_CLOSE);
+   if(ema_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create EMA indicator");
       return(INIT_FAILED);
    }
 
@@ -101,6 +113,10 @@ void OnDeinit(const int reason)
    // Release ATR indicator
    if(atr_handle != INVALID_HANDLE)
       IndicatorRelease(atr_handle);
+
+   // Release EMA indicator
+   if(ema_handle != INVALID_HANDLE)
+      IndicatorRelease(ema_handle);
 
    if(g_max_range_ever > 0)
    {
@@ -403,8 +419,29 @@ void PlacePendingOrders()
       g_orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
-   
-   
+
+
+   // Get current EMA value for trend confirmation
+   if(ema_handle == INVALID_HANDLE)
+   {
+      Print("EMA indicator not available for trend confirmation. No orders placed.");
+      g_orders_placed = true; // Mark as processed so we don't try again today
+      return;
+   }
+
+   double ema_buffer[];
+   ArraySetAsSeries(ema_buffer, true);
+
+   if(CopyBuffer(ema_handle, 0, 0, 1, ema_buffer) < 1)
+   {
+      Print("Failed to get EMA value for trend confirmation. No orders placed.");
+      g_orders_placed = true; // Mark as processed so we don't try again today
+      return;
+   }
+
+   double current_ema = ema_buffer[0];
+
+   // Calculate lot size for potential orders
    g_lot_size = CalculateLotSize(range_size);
    
    // Calculate SL and TP
@@ -423,50 +460,71 @@ void PlacePendingOrders()
       sell_tp = g_low_price - (range_size * take_profit / 100);
    }
    
-   // Place buy stop order at the high of the range
-   trade.SetExpertMagicNumber(magic_number);
-   
-   bool buy_success = trade.BuyStop(
-      g_lot_size,
-      g_high_price,
-      _Symbol,
-      buy_sl,
-      buy_tp,
-      ORDER_TIME_DAY,
-      0,
-      "Range Breakout Buy"
-   );
-   
-   if(buy_success)
+   // Get current prices for EMA trend confirmation
+   double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // Place buy stop order at the high of the range (only if in uptrend - price above EMA)
+   if(current_bid > current_ema) // Check if we're in an uptrend
    {
-      g_buy_ticket = trade.ResultOrder();
-      Print("Buy Stop order placed at ", g_high_price, " with lot size ", g_lot_size);
+      trade.SetExpertMagicNumber(magic_number);
+
+      bool buy_success = trade.BuyStop(
+         g_lot_size,
+         g_high_price,
+         _Symbol,
+         buy_sl,
+         buy_tp,
+         ORDER_TIME_DAY,
+         0,
+         "Range Breakout Buy"
+      );
+
+      if(buy_success)
+      {
+         g_buy_ticket = trade.ResultOrder();
+         Print("Buy Stop order placed at ", g_high_price, " (EMA Trend Confirm: ", current_ema, " < ", current_bid, ") with lot size ", g_lot_size);
+      }
+      else
+      {
+         Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      }
    }
    else
    {
-      Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      Print("Buy Stop order skipped - EMA trend filter failed. Current Bid: ", current_bid, ", EMA: ", current_ema);
+      g_buy_ticket = 0; // No buy order placed
    }
-   
-   // Place sell stop order at the low of the range
-   bool sell_success = trade.SellStop(
-      g_lot_size,
-      g_low_price,
-      _Symbol,
-      sell_sl,
-      sell_tp,
-      ORDER_TIME_DAY,
-      0,
-      "Range Breakout Sell"
-   );
-   
-   if(sell_success)
+
+   // Place sell stop order at the low of the range (only if in downtrend - price below EMA)
+   if(current_ask < current_ema) // Check if we're in a downtrend
    {
-      g_sell_ticket = trade.ResultOrder();
-      Print("Sell Stop order placed at ", g_low_price, " with lot size ", g_lot_size);
+      // Place sell stop order at the low of the range
+      bool sell_success = trade.SellStop(
+         g_lot_size,
+         g_low_price,
+         _Symbol,
+         sell_sl,
+         sell_tp,
+         ORDER_TIME_DAY,
+         0,
+         "Range Breakout Sell"
+      );
+
+      if(sell_success)
+      {
+         g_sell_ticket = trade.ResultOrder();
+         Print("Sell Stop order placed at ", g_low_price, " (EMA Trend Confirm: ", current_ema, " > ", current_ask, ") with lot size ", g_lot_size);
+      }
+      else
+      {
+         Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      }
    }
    else
    {
-      Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      Print("Sell Stop order skipped - EMA trend filter failed. Current Ask: ", current_ask, ", EMA: ", current_ema);
+      g_sell_ticket = 0; // No sell order placed
    }
    
    g_orders_placed = true;
