@@ -13,15 +13,15 @@ CTrade trade;
 // Input Parameters
 input int      magic_number = 12345;       // Magic Number
 input bool     autolot = true;            // Use autolot based on balance
-input double   base_balance = 100.0;      // Base balance for lot calculation
-input double   lot = 0.01;                  // Lot size for each base_balance unit
+input double   risk_percentage = 1.0;      // Risk % of balance per trade
 input double   min_lot = 0.01;             // Minimum lot size
 input double   max_lot = 10.0;             // Maximum lot size
 input int      stop_loss = 90;             // Stop Loss in % of the range (0=off)
 input int      take_profit = 0;            // Take Profit in % of the range (0=off)
 input int      range_start_time = 90;      // Range start time in minutes
-input int      range_duration = 270;       // Range duration in minutes (>1440=crosses midnight, e.g., 720 from 19:00=07:00 next day)
-input int      range_close_time = 1200;    // Range close time in minutes (-1=off, >1440=next day, e.g., 1560=2AM next day)
+input int      range_duration = 270;       // Range duration in minutes
+input int      range_close_time = 1200;    // Range close time in minutes (-1=off)
+input string   breakout_mode = "one breakout per range"; // Breakout Mode
 input bool     range_on_monday = true;     // Range on Monday
 input bool     range_on_tuesday = false;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
@@ -70,9 +70,9 @@ int OnInit()
    g_lines_drawn = false;
    g_trailing_points = trailing_stop;
    
-   // Set current day (using GMT time)
+   // Set current day
    MqlDateTime dt;
-   TimeGMT(dt);
+   TimeCurrent(dt);
    dt.hour = 0;
    dt.min = 0;
    dt.sec = 0;
@@ -80,14 +80,7 @@ int OnInit()
    
    // Delete any existing lines
    DeleteAllLines();
-
-   // Log GMT time confirmation
-   Print("=== Daily Breakout EA Initialized ===");
-   Print("Using GMT time for all calculations");
-   Print("Current GMT time: ", TimeToString(TimeGMT()));
-   Print("Current server time: ", TimeToString(TimeCurrent()));
-   Print("====================================");
-
+   
    return(INIT_SUCCEEDED);
 }
 
@@ -112,9 +105,9 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Check if day has changed (using GMT time)
+   // Check if day has changed
    MqlDateTime dt;
-   TimeGMT(dt);
+   TimeCurrent(dt);
    dt.hour = 0;
    dt.min = 0;
    dt.sec = 0;
@@ -130,7 +123,7 @@ void OnTick()
       DeleteAllLines();
    }
    
-   // Check if it's a valid trading day (using GMT time)
+   // Check if it's a valid trading day
    if(!IsTradingDay())
       return;
    
@@ -148,13 +141,8 @@ void OnTick()
       g_lines_drawn = true;
    }
    
-   // Check if we should place orders (using GMT time)
-   // Only place orders if we haven't passed the range close time (if it's set)
-   bool can_place_orders = !g_orders_placed && TimeGMT() >= g_range_end_time;
-   if(range_close_time > 0 && g_close_time > 0)
-      can_place_orders = can_place_orders && TimeGMT() < g_close_time;
-
-   if(can_place_orders)
+   // Check if we should place orders
+   if(!g_orders_placed && TimeCurrent() >= g_range_end_time)
    {
       PlacePendingOrders();
       return;
@@ -166,10 +154,10 @@ void OnTick()
       ManageTrailingStop();
    }
    
-   // Check if we should close all orders (using GMT time)
-   if(g_orders_placed && range_close_time > 0 && TimeGMT() >= g_close_time)
+   // Check if we should close all orders
+   if(g_orders_placed && range_close_time > 0 && TimeCurrent() >= g_close_time)
    {
-      CloseAllOrders(true); // Close due to range close time
+      CloseAllOrders();
       return;
    }
    
@@ -183,9 +171,9 @@ void OnTick()
 bool IsTradingDay()
 {
    MqlDateTime dt;
-   TimeGMT(dt);
+   TimeCurrent(dt);
    int day_of_week = dt.day_of_week;
-
+   
    switch(day_of_week)
    {
       case 1: return range_on_monday;
@@ -202,9 +190,9 @@ bool IsTradingDay()
 //+------------------------------------------------------------------+
 void CalculateDailyRange()
 {
-   datetime current_time = TimeGMT();
-
-   // Calculate range start time (from the start of the day using GMT)
+   datetime current_time = TimeCurrent();
+   
+   // Calculate range start time (from the start of the day)
    MqlDateTime dt;
    TimeToStruct(current_time, dt);
    
@@ -219,39 +207,11 @@ void CalculateDailyRange()
    g_range_start_time = today + range_start_time * 60;
    
    // Calculate range end time
-   int total_minutes = range_start_time + range_duration;
-
-   // Handle cross-day ranges (when total exceeds 1440 minutes = 24 hours)
-   if(total_minutes > 1440)
-   {
-      // Calculate end time for next day
-      datetime tomorrow = today + 86400; // Add 24 hours (86400 seconds)
-      int minutes_beyond_midnight = total_minutes - 1440;
-      g_range_end_time = tomorrow + minutes_beyond_midnight * 60;
-   }
-   else
-   {
-      // Same day range end time
-      g_range_end_time = g_range_start_time + range_duration * 60;
-   }
+   g_range_end_time = g_range_start_time + range_duration * 60;
    
    // Calculate order close time
    if(range_close_time > 0)
-   {
-      // Handle next-day times (>1440 minutes = 24 hours)
-      if(range_close_time > 1440)
-      {
-         // Calculate close time for next day
-         datetime tomorrow = today + 86400; // Add 24 hours (86400 seconds)
-         int minutes_beyond_midnight = range_close_time - 1440;
-         g_close_time = tomorrow + minutes_beyond_midnight * 60;
-      }
-      else
-      {
-         // Same day close time
-         g_close_time = today + range_close_time * 60;
-      }
-   }
+      g_close_time = today + range_close_time * 60;
    else
       g_close_time = 0; // No automatic close time
    
@@ -290,49 +250,24 @@ void CalculateDailyRange()
       g_range_calculated = true;
       double range_size = g_high_price - g_low_price;
       double range_points = range_size / _Point;
-
+      
       // Track maximum and minimum ranges observed
       if(range_points > g_max_range_ever)
       {
          g_max_range_ever = range_points;
-         g_max_range_date = TimeGMT();
+         g_max_range_date = TimeCurrent();
          Print("New maximum range detected: ", range_points, " points on ", TimeToString(g_max_range_date));
       }
-
+      
       if(range_points < g_min_range_ever)
       {
          g_min_range_ever = range_points;
-         g_min_range_date = TimeGMT();
+         g_min_range_date = TimeCurrent();
          Print("New minimum range detected: ", range_points, " points on ", TimeToString(g_min_range_date));
       }
-
-      Print("Daily range calculated - High: ", g_high_price, " Low: ", g_low_price,
+      
+      Print("Daily range calculated - High: ", g_high_price, " Low: ", g_low_price, 
             " Range: ", range_points, " points");
-
-      // Log range times once when calculation is complete
-      if(range_close_time > 0)
-      {
-         if(range_close_time > 1440)
-         {
-            Print("Range close time set to next day: ", range_close_time, " minutes = ",
-                  TimeToString(g_close_time));
-         }
-         else
-         {
-            Print("Range close time set to same day: ", range_close_time, " minutes = ",
-                  TimeToString(g_close_time));
-         }
-      }
-
-      // Log range period details
-      if(range_start_time + range_duration > 1440)
-      {
-         Print("Range period: ", TimeToString(g_range_start_time), " to ", TimeToString(g_range_end_time), " (crosses midnight)");
-      }
-      else
-      {
-         Print("Range period: ", TimeToString(g_range_start_time), " to ", TimeToString(g_range_end_time));
-      }
    }
    
    
@@ -346,25 +281,57 @@ double CalculateLotSize(double range_size)
    if(autolot) // Autolot mode
    {
       double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      
-      // Calculate lot size proportional to account balance
-      double balance_ratio = account_balance / base_balance;
-      double lot_size = NormalizeDouble(balance_ratio * lot, 2);
-      
+
+      // Calculate stop loss in price terms based on the range
+      double sl_price = 0;
+      if(stop_loss > 0)
+      {
+         sl_price = range_size * stop_loss / 100;  // SL as percentage of range
+      }
+      else
+      {
+         // If stop_loss is 0, we can't calculate proper risk, so use a reasonable default
+         // This approach estimates risk based on range size
+         sl_price = range_size * 0.1;  // Default to 10% of range if no stop loss percentage set
+      }
+
+      // Calculate lot size based on risk percentage
+      double risk_amount = account_balance * (risk_percentage / 100.0);  // Risk amount in account currency
+
+      // Get symbol properties for proper calculation
+      double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+      // Calculate lot size based on risk
+      double lot_size = 0;
+      if(sl_price > 0 && tick_value > 0)
+      {
+         // Calculate number of ticks in stop loss
+         double sl_in_ticks = sl_price / tick_size;
+         // Calculate lot size to risk the desired amount
+         lot_size = risk_amount / (sl_in_ticks * tick_value);
+      }
+      else
+      {
+         // Fallback: use a very conservative lot size if calculations fail
+         lot_size = min_lot;
+      }
+
       // Apply min/max limits
       if(lot_size < min_lot)
          lot_size = min_lot;
       else if(lot_size > max_lot)
          lot_size = max_lot;
-         
-      Print("Autolot calculation - Balance: ", account_balance, ", Base balance: ", base_balance, 
-            ", Balance ratio: ", balance_ratio, ", Base lot: ", lot, ", Calculated lot: ", lot_size);
-            
+
+      Print("Risk-based lot calculation - Balance: ", account_balance,
+            ", Risk %: ", risk_percentage, ", Risk amount: ", risk_amount,
+            ", SL in price: ", sl_price, ", Calculated lot: ", lot_size);
+
       return lot_size;
    }
-   else // Fixed lot size
+   else // Fixed lot size - keep as is for backward compatibility
    {
-      return lot; // Use lot as fixed lot value
+      return min_lot; // Use minimum lot as default fixed lot size
    }
 }
 
@@ -380,7 +347,7 @@ void PlacePendingOrders()
    double range_points = range_size / _Point;
    
    Print("=== Daily Range Details ===");
-   Print("Date (GMT): ", TimeToString(TimeGMT()));
+   Print("Date: ", TimeToString(TimeCurrent()));
    Print("Range High: ", g_high_price);
    Print("Range Low: ", g_low_price);
    Print("Range Size: ", range_points, " points");
@@ -475,97 +442,91 @@ void PlacePendingOrders()
 //+------------------------------------------------------------------+
 void ManageOrders()
 {
-   // Always enforce single breakout - check if one order has been triggered
-   bool buy_triggered = false;
-   bool sell_triggered = false;
-
-   // Get order information
-   if(g_buy_ticket > 0)
+   // If using "one breakout per range" mode, check if one order has been triggered
+   if(StringCompare(breakout_mode, "one breakout per range") == 0)
    {
-      // Check if the order still exists and if it's a market order (was triggered)
-      if(OrderSelect(g_buy_ticket))
+      bool buy_triggered = false;
+      bool sell_triggered = false;
+      
+      // Get order information
+      if(g_buy_ticket > 0)
       {
-         ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         if(order_type == ORDER_TYPE_BUY) // Changed from pending to market = triggered
-            buy_triggered = true;
-      }
-      else
-      {
-         // Check if it became a position (was triggered and is still open)
-         if(PositionSelectByTicket(g_buy_ticket))
+         // Check if the order still exists and if it's a market order (was triggered)
+         if(OrderSelect(g_buy_ticket))
          {
-            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            if(order_type == ORDER_TYPE_BUY) // Changed from pending to market = triggered
                buy_triggered = true;
          }
          else
          {
-            g_buy_ticket = 0; // Order no longer exists
+            // Check if it became a position (was triggered and is still open)
+            if(PositionSelectByTicket(g_buy_ticket))
+            {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                  buy_triggered = true;
+            }
+            else
+            {
+               g_buy_ticket = 0; // Order no longer exists
+            }
          }
       }
-   }
-
-   // Check if sell stop order has been triggered
-   if(g_sell_ticket > 0)
-   {
-      // Check if the order still exists and if it's a market order (was triggered)
-      if(OrderSelect(g_sell_ticket))
+      
+      // Check if sell stop order has been triggered
+      if(g_sell_ticket > 0)
       {
-         ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         if(order_type == ORDER_TYPE_SELL) // Changed from pending to market = triggered
-            sell_triggered = true;
-      }
-      else
-      {
-         // Check if it became a position (was triggered and is still open)
-         if(PositionSelectByTicket(g_sell_ticket))
+         // Check if the order still exists and if it's a market order (was triggered)
+         if(OrderSelect(g_sell_ticket))
          {
-            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            if(order_type == ORDER_TYPE_SELL) // Changed from pending to market = triggered
                sell_triggered = true;
          }
          else
          {
-            g_sell_ticket = 0; // Order no longer exists
+            // Check if it became a position (was triggered and is still open)
+            if(PositionSelectByTicket(g_sell_ticket))
+            {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+                  sell_triggered = true;
+            }
+            else
+            {
+               g_sell_ticket = 0; // Order no longer exists
+            }
          }
       }
-   }
-
-   // If one order has been triggered, delete the other pending order
-   if(buy_triggered && g_sell_ticket > 0)
-   {
-      if(OrderSelect(g_sell_ticket))
+      
+      // If one order has been triggered, delete the other pending order
+      if(buy_triggered && g_sell_ticket > 0)
       {
-         ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         if(order_type == ORDER_TYPE_SELL_STOP)
-            trade.OrderDelete(g_sell_ticket);
+         if(OrderSelect(g_sell_ticket))
+         {
+            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            if(order_type == ORDER_TYPE_SELL_STOP)
+               trade.OrderDelete(g_sell_ticket);
+         }
+         g_sell_ticket = 0;
       }
-      g_sell_ticket = 0;
-   }
-   else if(sell_triggered && g_buy_ticket > 0)
-   {
-      if(OrderSelect(g_buy_ticket))
+      else if(sell_triggered && g_buy_ticket > 0)
       {
-         ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         if(order_type == ORDER_TYPE_BUY_STOP)
-            trade.OrderDelete(g_buy_ticket);
+         if(OrderSelect(g_buy_ticket))
+         {
+            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            if(order_type == ORDER_TYPE_BUY_STOP)
+               trade.OrderDelete(g_buy_ticket);
+         }
+         g_buy_ticket = 0;
       }
-      g_buy_ticket = 0;
    }
 }
 
 //+------------------------------------------------------------------+
 //| Close all orders for this EA                                     |
 //+------------------------------------------------------------------+
-void CloseAllOrders(bool is_range_close_time = false)
+void CloseAllOrders()
 {
-   // Log the reason for closure
-   if(is_range_close_time)
-   {
-      Print("=== Range Close Time Triggered ===");
-      Print("Current time (GMT): ", TimeToString(TimeGMT()));
-      Print("Range close time (GMT): ", TimeToString(g_close_time));
-      Print("Closing all positions and pending orders due to range close time...");
-      Print("==================================");
-   }
    // Close all positions with this magic number
    int positions_total = PositionsTotal();
    for(int i = positions_total - 1; i >= 0; i--)
@@ -575,8 +536,6 @@ void CloseAllOrders(bool is_range_close_time = false)
       {
          if(PositionGetInteger(POSITION_MAGIC) == magic_number && PositionGetString(POSITION_SYMBOL) == _Symbol)
          {
-            if(is_range_close_time)
-               Print("Range Close Time: Closing position #", position_ticket);
             trade.PositionClose(position_ticket);
             if(trade.ResultRetcode() != TRADE_RETCODE_DONE)
                Print("Failed to close position #", position_ticket, ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
@@ -593,8 +552,6 @@ void CloseAllOrders(bool is_range_close_time = false)
       {
          if(OrderGetInteger(ORDER_MAGIC) == magic_number && OrderGetString(ORDER_SYMBOL) == _Symbol)
          {
-            if(is_range_close_time)
-               Print("Range Close Time: Deleting pending order #", order_ticket);
             trade.OrderDelete(order_ticket);
             if(trade.ResultRetcode() != TRADE_RETCODE_DONE)
                Print("Failed to delete order #", order_ticket, ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
