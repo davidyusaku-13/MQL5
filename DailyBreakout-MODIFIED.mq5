@@ -14,7 +14,6 @@ CTrade trade;
 input int      magic_number = 12345;       // Magic Number
 input bool     autolot = true;            // Use autolot based on balance
 input double   risk_percentage = 1.0;      // Risk % of balance per trade
-input double   min_lot = 0.01;             // Minimum lot size
 input double   max_lot = 10.0;             // Maximum lot size
 input int      stop_loss = 90;             // Stop Loss in % of the range (0=off)
 input int      take_profit = 0;            // Take Profit in % of the range (0=off)
@@ -23,7 +22,7 @@ input int      range_duration = 270;       // Range duration in minutes
 input int      range_close_time = 1200;    // Range close time in minutes (-1=off)
 input string   breakout_mode = "one breakout per range"; // Breakout Mode
 input bool     range_on_monday = true;     // Range on Monday
-input bool     range_on_tuesday = false;    // Range on Tuesday
+input bool     range_on_tuesday = true;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
 input bool     range_on_thursday = true;   // Range on Thursday
 input bool     range_on_friday = true;     // Range on Friday
@@ -329,25 +328,36 @@ double CalculateLotSize(double range_size)
       }
       else
       {
-         // Fallback: use a very conservative lot size if calculations fail
-         lot_size = min_lot;
+         // Fallback: use the symbol minimum lot size if calculations fail
+         lot_size = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       }
 
-      // Apply min/max limits
-      if(lot_size < min_lot)
-         lot_size = min_lot;
+      // Apply limits based on symbol specifications and max_lot parameter
+      double symbol_min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double symbol_max = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+      // Use a reasonable minimum (symbol minimum or 0.01 as a floor)
+      double effective_min_lot = MathMax(symbol_min, 0.01);  // Use 0.01 as minimum floor
+
+      if(lot_size < effective_min_lot)
+         lot_size = effective_min_lot;
       else if(lot_size > max_lot)
          lot_size = max_lot;
+      // Also respect the symbol's maximum lot size
+      else if(lot_size > symbol_max)
+         lot_size = symbol_max;
 
       Print("Risk-based lot calculation - Balance: ", account_balance,
             ", Risk %: ", risk_percentage, ", Risk amount: ", risk_amount,
-            ", SL in price: ", sl_price, ", Calculated lot: ", lot_size);
+            ", SL in price: ", sl_price, ", Calculated lot: ", lot_size,
+            ", Min lot: ", effective_min_lot, ", Max lot: ", max_lot);
 
       return lot_size;
    }
    else // Fixed lot size - keep as is for backward compatibility
    {
-      return min_lot; // Use minimum lot as default fixed lot size
+      // For fixed lot mode, return the symbol's minimum lot size
+      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    }
 }
 
