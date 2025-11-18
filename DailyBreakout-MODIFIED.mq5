@@ -29,7 +29,7 @@ input bool     range_on_thursday = true;   // Range on Thursday
 input bool     range_on_friday = true;     // Range on Friday
 input int      atr_period = 14;            // ATR period for trailing stops
 input double   atr_multiplier = 3.0;       // ATR multiplier for trailing stops
-input int      trailing_start = 500;       // Activate trailing after profit in points (in points)
+input double   trailing_atr_multiplier = 1.0; // ATR multiplier for trailing activation threshold
 input double   max_atr_threshold = 100.0;  // Maximum ATR value allowed for trading (0=off)
 
 
@@ -600,10 +600,10 @@ void CloseAllOrders()
 //+------------------------------------------------------------------+
 void ManageTrailingStop()
 {
-   if(atr_period <= 0 || trailing_start <= 0 || atr_handle == INVALID_HANDLE)
+   if(atr_period <= 0 || atr_multiplier <= 0 || atr_handle == INVALID_HANDLE)
       return;
 
-   // Get current ATR value
+   // Get current ATR values
    double atr_buffer[];
    ArraySetAsSeries(atr_buffer, true);
 
@@ -643,8 +643,11 @@ void ManageTrailingStop()
             else
                profit_points = (position_open_price - current_price) / _Point;
 
-            // If profit has not reached trailing_start, skip
-            if(profit_points < trailing_start)
+            // Calculate required profit based on ATR (instead of fixed points)
+            double required_profit = trailing_atr_multiplier * current_atr / _Point;
+
+            // If profit has not reached ATR-based threshold, skip
+            if(profit_points < required_profit)
                continue;
 
             // Calculate new stop loss level based on ATR
