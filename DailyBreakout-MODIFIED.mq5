@@ -27,8 +27,9 @@ input bool     range_on_tuesday = false;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
 input bool     range_on_thursday = true;   // Range on Thursday
 input bool     range_on_friday = true;     // Range on Friday
-input int      trailing_stop = 300;        // Trailing Stop in points (0=off)
-input int      trailing_start = 500;       // Activate trailing after profit in points
+input int      atr_period = 14;            // ATR period for trailing stops
+input double   atr_multiplier = 3.0;       // ATR multiplier for trailing stops
+input int      trailing_start = 500;       // Activate trailing after profit in points (in points)
 input double   max_range_size = 1500;         // Maximum range size in points (0=off)
 input double   min_range_size = 500;         // Minimum range size in points (0=off)
 
@@ -55,8 +56,11 @@ bool g_trailing_activated = false; // Default trailing status
 // Add these global variables to track ranges
 double g_max_range_ever = 0;    // Track maximum range seen
 double g_min_range_ever = 999999; // Track minimum range seen
-datetime g_max_range_date = 0;  // Date of maximum range 
+datetime g_max_range_date = 0;  // Date of maximum range
 datetime g_min_range_date = 0;  // Date of minimum range
+
+// ATR indicator handle
+int atr_handle = INVALID_HANDLE;
 
 
 //+------------------------------------------------------------------+
@@ -68,8 +72,16 @@ int OnInit()
    g_range_calculated = false;
    g_orders_placed = false;
    g_lines_drawn = false;
-   g_trailing_points = trailing_stop;
-   
+   g_trailing_points = atr_period;  // Update to use ATR period instead
+
+   // Initialize ATR indicator
+   atr_handle = iATR(_Symbol, PERIOD_CURRENT, atr_period);
+   if(atr_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create ATR indicator");
+      return(INIT_FAILED);
+   }
+
    // Set current day
    MqlDateTime dt;
    TimeCurrent(dt);
@@ -77,10 +89,10 @@ int OnInit()
    dt.min = 0;
    dt.sec = 0;
    g_current_day = StructToTime(dt);
-   
+
    // Delete any existing lines
    DeleteAllLines();
-   
+
    return(INIT_SUCCEEDED);
 }
 
@@ -91,6 +103,11 @@ void OnDeinit(const int reason)
 {
    // Clean up
    DeleteAllLines();
+
+   // Release ATR indicator
+   if(atr_handle != INVALID_HANDLE)
+      IndicatorRelease(atr_handle);
+
    if(g_max_range_ever > 0)
    {
       Print("=== Range Statistics ===");
@@ -148,8 +165,8 @@ void OnTick()
       return;
    }
    
-   // Apply trailing stop to open positions if enabled
-   if(trailing_stop > 0)
+   // Apply ATR trailing stop to open positions if enabled
+   if(atr_period > 0 && atr_multiplier > 0)
    {
       ManageTrailingStop();
    }
@@ -567,18 +584,29 @@ void CloseAllOrders()
 }
 
 //+------------------------------------------------------------------+
-//| Manage trailing stop for open positions                         |
+//| Manage ATR-based trailing stop for open positions               |
 //+------------------------------------------------------------------+
 void ManageTrailingStop()
 {
-   if(trailing_stop <= 0 || trailing_start <= 0)
+   if(atr_period <= 0 || trailing_start <= 0 || atr_handle == INVALID_HANDLE)
       return;
-      
+
+   // Get current ATR value
+   double atr_buffer[];
+   ArraySetAsSeries(atr_buffer, true);
+
+   if(CopyBuffer(atr_handle, 0, 0, 2, atr_buffer) < 2)
+      return;
+
+   double current_atr = atr_buffer[0];
+   if(current_atr <= 0)
+      return;
+
    // Check all open positions
    for(int i = 0; i < PositionsTotal(); i++)
    {
       ulong position_ticket = PositionGetTicket(i);
-      
+
       if(position_ticket > 0)
       {
          // Check if this position belongs to our EA
@@ -589,49 +617,56 @@ void ManageTrailingStop()
             double position_sl = PositionGetDouble(POSITION_SL);
             double position_tp = PositionGetDouble(POSITION_TP);
             ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-            
+
             // Current price depending on position type
-            double current_price = (position_type == POSITION_TYPE_BUY) ? 
-                                  SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+            double current_price = (position_type == POSITION_TYPE_BUY) ?
+                                  SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                                   SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            
+
             // Calculate current profit in points
             double profit_points = 0;
-            
+
             if(position_type == POSITION_TYPE_BUY)
                profit_points = (current_price - position_open_price) / _Point;
             else
                profit_points = (position_open_price - current_price) / _Point;
-               
+
             // If profit has not reached trailing_start, skip
             if(profit_points < trailing_start)
                continue;
-            
-            // Calculate new stop loss level
+
+            // Calculate new stop loss level based on ATR
             double new_sl = 0;
-            
+            double atr_distance = atr_multiplier * current_atr;
+
             if(position_type == POSITION_TYPE_BUY)
             {
-               // For buy positions, trail below current price
-               new_sl = current_price - trailing_stop * _Point;
-               
-               // Only modify if new SL is higher than current SL
+               // For buy positions, trail below current price by ATR multiple
+               new_sl = current_price - atr_distance;
+
+               // For ATR trailing stops, we want the highest value (most protective for longs)
+               // Only update if the new SL is higher than current SL or no SL is set
                if(position_sl == 0 || new_sl > position_sl)
                {
                   trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
+                  Print("ATR Trailing stop for BUY position #", position_ticket,
+                        " - Current ATR: ", current_atr, ", ATR Distance: ", atr_distance,
+                        " - Old SL: ", position_sl, " -> New SL: ", new_sl);
                }
             }
-            else
+            else // SELL position
             {
-               // For sell positions, trail above current price
-               new_sl = current_price + trailing_stop * _Point;
-               
-               // Only modify if new SL is lower than current SL or no SL is set
+               // For sell positions, trail above current price by ATR multiple
+               new_sl = current_price + atr_distance;
+
+               // For ATR trailing stops on shorts, we want the lowest value (most protective for shorts)
+               // Only update if the new SL is lower than current SL or no SL is set
                if(position_sl == 0 || new_sl < position_sl)
                {
                   trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
+                  Print("ATR Trailing stop for SELL position #", position_ticket,
+                        " - Current ATR: ", current_atr, ", ATR Distance: ", atr_distance,
+                        " - Old SL: ", position_sl, " -> New SL: ", new_sl);
                }
             }
          }
