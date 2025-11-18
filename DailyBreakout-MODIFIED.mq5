@@ -1,7 +1,3 @@
-//+------------------------------------------------------------------+
-//|                                            Daily Range Breakout EA |
-//|                                                                    |
-//+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
 #property link      ""
 #property version   "1.00"
@@ -20,7 +16,7 @@ input int      take_profit = 0;            // Take Profit in % of the range (0=o
 input int      range_start_time = 90;      // Range start time in minutes
 input int      range_duration = 270;       // Range duration in minutes
 input int      range_close_time = 1200;    // Range close time in minutes (-1=off)
-input string   breakout_mode = "one breakout per range"; // Breakout Mode
+input bool     single_breakout_only = true;  // Allow only one breakout per range (if true: cancel opposite order when one triggers)
 input bool     range_on_monday = true;     // Range on Monday
 input bool     range_on_tuesday = true;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
@@ -481,8 +477,8 @@ void PlacePendingOrders()
 //+------------------------------------------------------------------+
 void ManageOrders()
 {
-   // If using "one breakout per range" mode, check if one order has been triggered
-   if(StringCompare(breakout_mode, "one breakout per range") == 0)
+   // If single breakout mode is enabled, check if one order has been triggered
+   if(single_breakout_only)
    {
       bool buy_triggered = false;
       bool sell_triggered = false;
