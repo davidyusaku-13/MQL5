@@ -30,8 +30,7 @@ input bool     range_on_friday = true;     // Range on Friday
 input int      atr_period = 14;            // ATR period for trailing stops
 input double   atr_multiplier = 3.0;       // ATR multiplier for trailing stops
 input int      trailing_start = 500;       // Activate trailing after profit in points (in points)
-input double   max_range_size = 1500;         // Maximum range size in points (0=off)
-input double   min_range_size = 500;         // Minimum range size in points (0=off)
+input double   max_atr_threshold = 100.0;  // Maximum ATR value allowed for trading (0=off)
 
 
 // Global Variables
@@ -371,17 +370,30 @@ void PlacePendingOrders()
    Print("=========================");
    
       
-   // Check if range size is within acceptable limits
-   if(max_range_size > 0 && range_points > max_range_size)
+   // Get current ATR value for range validation
+   if(atr_handle == INVALID_HANDLE)
    {
-      Print("Range size (", range_points, " points) exceeds maximum (", max_range_size, " points). No orders placed.");
+      Print("ATR indicator not available for range validation. No orders placed.");
       g_orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
-   
-   if(min_range_size > 0 && range_points < min_range_size)
+
+   double atr_buffer[];
+   ArraySetAsSeries(atr_buffer, true);
+
+   if(CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) < 1)
    {
-      Print("Range size (", range_points, " points) is below minimum (", min_range_size, " points). No orders placed.");
+      Print("Failed to get ATR value for range validation. No orders placed.");
+      g_orders_placed = true; // Mark as processed so we don't try again today
+      return;
+   }
+
+   double current_atr = atr_buffer[0];
+
+   // Check if ATR is within acceptable limits for trading
+   if(max_atr_threshold > 0 && current_atr > max_atr_threshold)
+   {
+      Print("Current ATR (", current_atr, ") exceeds maximum threshold (", max_atr_threshold, "). No orders placed.");
       g_orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
