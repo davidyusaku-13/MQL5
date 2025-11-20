@@ -1,3 +1,7 @@
+//+------------------------------------------------------------------+
+//|                                            Daily Range Breakout EA |
+//|                                                                    |
+//+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
 #property link      ""
 #property version   "1.00"
@@ -9,24 +13,25 @@ CTrade trade;
 // Input Parameters
 input int      magic_number = 12345;       // Magic Number
 input bool     autolot = true;            // Use autolot based on balance
-input double   risk_percentage = 1.0;      // Risk % of balance per trade
+input double   base_balance = 100.0;      // Base balance for lot calculation
+input double   lot = 0.01;                  // Lot size for each base_balance unit
+input double   min_lot = 0.01;             // Minimum lot size
 input double   max_lot = 10.0;             // Maximum lot size
 input int      stop_loss = 90;             // Stop Loss in % of the range (0=off)
 input int      take_profit = 0;            // Take Profit in % of the range (0=off)
 input int      range_start_time = 90;      // Range start time in minutes
 input int      range_duration = 270;       // Range duration in minutes
 input int      range_close_time = 1200;    // Range close time in minutes (-1=off)
-input bool     single_breakout_only = true;  // Allow only one breakout per range (if true: cancel opposite order when one triggers)
-input int      ema_period = 200;             // EMA period for trend confirmation
+input string   breakout_mode = "one breakout per range"; // Breakout Mode
 input bool     range_on_monday = true;     // Range on Monday
-input bool     range_on_tuesday = true;    // Range on Tuesday
+input bool     range_on_tuesday = false;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
 input bool     range_on_thursday = true;   // Range on Thursday
 input bool     range_on_friday = true;     // Range on Friday
-input int      atr_period = 14;            // ATR period for trailing stops
-input double   atr_multiplier = 3.0;       // ATR multiplier for trailing stops
-input double   trailing_atr_multiplier = 1.0; // ATR multiplier for trailing activation threshold
-input double   max_atr_threshold = 100.0;  // Maximum ATR value allowed for trading (0=off)
+input int      trailing_stop = 300;        // Trailing Stop in points (0=off)
+input int      trailing_start = 500;       // Activate trailing after profit in points
+input double   max_range_size = 1500;         // Maximum range size in points (0=off)
+input double   min_range_size = 500;         // Minimum range size in points (0=off)
 
 
 // Global Variables
@@ -51,14 +56,8 @@ bool g_trailing_activated = false; // Default trailing status
 // Add these global variables to track ranges
 double g_max_range_ever = 0;    // Track maximum range seen
 double g_min_range_ever = 999999; // Track minimum range seen
-datetime g_max_range_date = 0;  // Date of maximum range
+datetime g_max_range_date = 0;  // Date of maximum range 
 datetime g_min_range_date = 0;  // Date of minimum range
-
-// ATR indicator handle
-int atr_handle = INVALID_HANDLE;
-
-// EMA indicator handle for trend confirmation
-int ema_handle = INVALID_HANDLE;
 
 
 //+------------------------------------------------------------------+
@@ -70,24 +69,8 @@ int OnInit()
    g_range_calculated = false;
    g_orders_placed = false;
    g_lines_drawn = false;
-   g_trailing_points = atr_period;  // Update to use ATR period instead
-
-   // Initialize ATR indicator
-   atr_handle = iATR(_Symbol, PERIOD_CURRENT, atr_period);
-   if(atr_handle == INVALID_HANDLE)
-   {
-      Print("Failed to create ATR indicator");
-      return(INIT_FAILED);
-   }
-
-   // Initialize EMA indicator for trend confirmation
-   ema_handle = iMA(_Symbol, PERIOD_M1, ema_period, 0, MODE_EMA, PRICE_CLOSE);
-   if(ema_handle == INVALID_HANDLE)
-   {
-      Print("Failed to create EMA indicator");
-      return(INIT_FAILED);
-   }
-
+   g_trailing_points = trailing_stop;
+   
    // Set current day
    MqlDateTime dt;
    TimeCurrent(dt);
@@ -95,10 +78,10 @@ int OnInit()
    dt.min = 0;
    dt.sec = 0;
    g_current_day = StructToTime(dt);
-
+   
    // Delete any existing lines
    DeleteAllLines();
-
+   
    return(INIT_SUCCEEDED);
 }
 
@@ -109,15 +92,6 @@ void OnDeinit(const int reason)
 {
    // Clean up
    DeleteAllLines();
-
-   // Release ATR indicator
-   if(atr_handle != INVALID_HANDLE)
-      IndicatorRelease(atr_handle);
-
-   // Release EMA indicator
-   if(ema_handle != INVALID_HANDLE)
-      IndicatorRelease(ema_handle);
-
    if(g_max_range_ever > 0)
    {
       Print("=== Range Statistics ===");
@@ -175,8 +149,8 @@ void OnTick()
       return;
    }
    
-   // Apply ATR trailing stop to open positions if enabled
-   if(atr_period > 0 && atr_multiplier > 0)
+   // Apply trailing stop to open positions if enabled
+   if(trailing_stop > 0)
    {
       ManageTrailingStop();
    }
@@ -308,68 +282,25 @@ double CalculateLotSize(double range_size)
    if(autolot) // Autolot mode
    {
       double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-
-      // Calculate stop loss in price terms based on the range
-      double sl_price = 0;
-      if(stop_loss > 0)
-      {
-         sl_price = range_size * stop_loss / 100;  // SL as percentage of range
-      }
-      else
-      {
-         // If stop_loss is 0, we can't calculate proper risk, so use a reasonable default
-         // This approach estimates risk based on range size
-         sl_price = range_size * 0.1;  // Default to 10% of range if no stop loss percentage set
-      }
-
-      // Calculate lot size based on risk percentage
-      double risk_amount = account_balance * (risk_percentage / 100.0);  // Risk amount in account currency
-
-      // Get symbol properties for proper calculation
-      double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-
-      // Calculate lot size based on risk
-      double lot_size = 0;
-      if(sl_price > 0 && tick_value > 0)
-      {
-         // Calculate number of ticks in stop loss
-         double sl_in_ticks = sl_price / tick_size;
-         // Calculate lot size to risk the desired amount
-         lot_size = risk_amount / (sl_in_ticks * tick_value);
-      }
-      else
-      {
-         // Fallback: use the symbol minimum lot size if calculations fail
-         lot_size = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-      }
-
-      // Apply limits based on symbol specifications and max_lot parameter
-      double symbol_min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-      double symbol_max = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-
-      // Use a reasonable minimum (symbol minimum or 0.01 as a floor)
-      double effective_min_lot = MathMax(symbol_min, 0.01);  // Use 0.01 as minimum floor
-
-      if(lot_size < effective_min_lot)
-         lot_size = effective_min_lot;
+      
+      // Calculate lot size proportional to account balance
+      double balance_ratio = account_balance / base_balance;
+      double lot_size = NormalizeDouble(balance_ratio * lot, 2);
+      
+      // Apply min/max limits
+      if(lot_size < min_lot)
+         lot_size = min_lot;
       else if(lot_size > max_lot)
          lot_size = max_lot;
-      // Also respect the symbol's maximum lot size
-      else if(lot_size > symbol_max)
-         lot_size = symbol_max;
-
-      Print("Risk-based lot calculation - Balance: ", account_balance,
-            ", Risk %: ", risk_percentage, ", Risk amount: ", risk_amount,
-            ", SL in price: ", sl_price, ", Calculated lot: ", lot_size,
-            ", Min lot: ", effective_min_lot, ", Max lot: ", max_lot);
-
+         
+      Print("Autolot calculation - Balance: ", account_balance, ", Base balance: ", base_balance, 
+            ", Balance ratio: ", balance_ratio, ", Base lot: ", lot, ", Calculated lot: ", lot_size);
+            
       return lot_size;
    }
-   else // Fixed lot size - keep as is for backward compatibility
+   else // Fixed lot size
    {
-      // For fixed lot mode, return the symbol's minimum lot size
-      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      return lot; // Use lot as fixed lot value
    }
 }
 
@@ -392,56 +323,22 @@ void PlacePendingOrders()
    Print("=========================");
    
       
-   // Get current ATR value for range validation
-   if(atr_handle == INVALID_HANDLE)
+   // Check if range size is within acceptable limits
+   if(max_range_size > 0 && range_points > max_range_size)
    {
-      Print("ATR indicator not available for range validation. No orders placed.");
+      Print("Range size (", range_points, " points) exceeds maximum (", max_range_size, " points). No orders placed.");
       g_orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
-
-   double atr_buffer[];
-   ArraySetAsSeries(atr_buffer, true);
-
-   if(CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) < 1)
+   
+   if(min_range_size > 0 && range_points < min_range_size)
    {
-      Print("Failed to get ATR value for range validation. No orders placed.");
+      Print("Range size (", range_points, " points) is below minimum (", min_range_size, " points). No orders placed.");
       g_orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
-
-   double current_atr = atr_buffer[0];
-
-   // Check if ATR is within acceptable limits for trading
-   if(max_atr_threshold > 0 && current_atr > max_atr_threshold)
-   {
-      Print("Current ATR (", current_atr, ") exceeds maximum threshold (", max_atr_threshold, "). No orders placed.");
-      g_orders_placed = true; // Mark as processed so we don't try again today
-      return;
-   }
-
-
-   // Get current EMA value for trend confirmation
-   if(ema_handle == INVALID_HANDLE)
-   {
-      Print("EMA indicator not available for trend confirmation. No orders placed.");
-      g_orders_placed = true; // Mark as processed so we don't try again today
-      return;
-   }
-
-   double ema_buffer[];
-   ArraySetAsSeries(ema_buffer, true);
-
-   if(CopyBuffer(ema_handle, 0, 0, 1, ema_buffer) < 1)
-   {
-      Print("Failed to get EMA value for trend confirmation. No orders placed.");
-      g_orders_placed = true; // Mark as processed so we don't try again today
-      return;
-   }
-
-   double current_ema = ema_buffer[0];
-
-   // Calculate lot size for potential orders
+   
+   
    g_lot_size = CalculateLotSize(range_size);
    
    // Calculate SL and TP
@@ -460,71 +357,50 @@ void PlacePendingOrders()
       sell_tp = g_low_price - (range_size * take_profit / 100);
    }
    
-   // Get current prices for EMA trend confirmation
-   double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   // Place buy stop order at the high of the range (only if in uptrend - price above EMA)
-   if(current_bid > current_ema) // Check if we're in an uptrend
+   // Place buy stop order at the high of the range
+   trade.SetExpertMagicNumber(magic_number);
+   
+   bool buy_success = trade.BuyStop(
+      g_lot_size,
+      g_high_price,
+      _Symbol,
+      buy_sl,
+      buy_tp,
+      ORDER_TIME_DAY,
+      0,
+      "Range Breakout Buy"
+   );
+   
+   if(buy_success)
    {
-      trade.SetExpertMagicNumber(magic_number);
-
-      bool buy_success = trade.BuyStop(
-         g_lot_size,
-         g_high_price,
-         _Symbol,
-         buy_sl,
-         buy_tp,
-         ORDER_TIME_DAY,
-         0,
-         "Range Breakout Buy"
-      );
-
-      if(buy_success)
-      {
-         g_buy_ticket = trade.ResultOrder();
-         Print("Buy Stop order placed at ", g_high_price, " (EMA Trend Confirm: ", current_ema, " < ", current_bid, ") with lot size ", g_lot_size);
-      }
-      else
-      {
-         Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
-      }
+      g_buy_ticket = trade.ResultOrder();
+      Print("Buy Stop order placed at ", g_high_price, " with lot size ", g_lot_size);
    }
    else
    {
-      Print("Buy Stop order skipped - EMA trend filter failed. Current Bid: ", current_bid, ", EMA: ", current_ema);
-      g_buy_ticket = 0; // No buy order placed
+      Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
    }
-
-   // Place sell stop order at the low of the range (only if in downtrend - price below EMA)
-   if(current_ask < current_ema) // Check if we're in a downtrend
+   
+   // Place sell stop order at the low of the range
+   bool sell_success = trade.SellStop(
+      g_lot_size,
+      g_low_price,
+      _Symbol,
+      sell_sl,
+      sell_tp,
+      ORDER_TIME_DAY,
+      0,
+      "Range Breakout Sell"
+   );
+   
+   if(sell_success)
    {
-      // Place sell stop order at the low of the range
-      bool sell_success = trade.SellStop(
-         g_lot_size,
-         g_low_price,
-         _Symbol,
-         sell_sl,
-         sell_tp,
-         ORDER_TIME_DAY,
-         0,
-         "Range Breakout Sell"
-      );
-
-      if(sell_success)
-      {
-         g_sell_ticket = trade.ResultOrder();
-         Print("Sell Stop order placed at ", g_low_price, " (EMA Trend Confirm: ", current_ema, " > ", current_ask, ") with lot size ", g_lot_size);
-      }
-      else
-      {
-         Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
-      }
+      g_sell_ticket = trade.ResultOrder();
+      Print("Sell Stop order placed at ", g_low_price, " with lot size ", g_lot_size);
    }
    else
    {
-      Print("Sell Stop order skipped - EMA trend filter failed. Current Ask: ", current_ask, ", EMA: ", current_ema);
-      g_sell_ticket = 0; // No sell order placed
+      Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
    }
    
    g_orders_placed = true;
@@ -535,8 +411,8 @@ void PlacePendingOrders()
 //+------------------------------------------------------------------+
 void ManageOrders()
 {
-   // If single breakout mode is enabled, check if one order has been triggered
-   if(single_breakout_only)
+   // If using "one breakout per range" mode, check if one order has been triggered
+   if(StringCompare(breakout_mode, "one breakout per range") == 0)
    {
       bool buy_triggered = false;
       bool sell_triggered = false;
@@ -660,29 +536,18 @@ void CloseAllOrders()
 }
 
 //+------------------------------------------------------------------+
-//| Manage ATR-based trailing stop for open positions               |
+//| Manage trailing stop for open positions                         |
 //+------------------------------------------------------------------+
 void ManageTrailingStop()
 {
-   if(atr_period <= 0 || atr_multiplier <= 0 || atr_handle == INVALID_HANDLE)
+   if(trailing_stop <= 0 || trailing_start <= 0)
       return;
-
-   // Get current ATR values
-   double atr_buffer[];
-   ArraySetAsSeries(atr_buffer, true);
-
-   if(CopyBuffer(atr_handle, 0, 0, 2, atr_buffer) < 2)
-      return;
-
-   double current_atr = atr_buffer[0];
-   if(current_atr <= 0)
-      return;
-
+      
    // Check all open positions
    for(int i = 0; i < PositionsTotal(); i++)
    {
       ulong position_ticket = PositionGetTicket(i);
-
+      
       if(position_ticket > 0)
       {
          // Check if this position belongs to our EA
@@ -693,59 +558,49 @@ void ManageTrailingStop()
             double position_sl = PositionGetDouble(POSITION_SL);
             double position_tp = PositionGetDouble(POSITION_TP);
             ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
+            
             // Current price depending on position type
-            double current_price = (position_type == POSITION_TYPE_BUY) ?
-                                  SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+            double current_price = (position_type == POSITION_TYPE_BUY) ? 
+                                  SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
                                   SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
+            
             // Calculate current profit in points
             double profit_points = 0;
-
+            
             if(position_type == POSITION_TYPE_BUY)
                profit_points = (current_price - position_open_price) / _Point;
             else
                profit_points = (position_open_price - current_price) / _Point;
-
-            // Calculate required profit based on ATR (instead of fixed points)
-            double required_profit = trailing_atr_multiplier * current_atr / _Point;
-
-            // If profit has not reached ATR-based threshold, skip
-            if(profit_points < required_profit)
+               
+            // If profit has not reached trailing_start, skip
+            if(profit_points < trailing_start)
                continue;
-
-            // Calculate new stop loss level based on ATR
+            
+            // Calculate new stop loss level
             double new_sl = 0;
-            double atr_distance = atr_multiplier * current_atr;
-
+            
             if(position_type == POSITION_TYPE_BUY)
             {
-               // For buy positions, trail below current price by ATR multiple
-               new_sl = current_price - atr_distance;
-
-               // For ATR trailing stops, we want the highest value (most protective for longs)
-               // Only update if the new SL is higher than current SL or no SL is set
+               // For buy positions, trail below current price
+               new_sl = current_price - trailing_stop * _Point;
+               
+               // Only modify if new SL is higher than current SL
                if(position_sl == 0 || new_sl > position_sl)
                {
                   trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("ATR Trailing stop for BUY position #", position_ticket,
-                        " - Current ATR: ", current_atr, ", ATR Distance: ", atr_distance,
-                        " - Old SL: ", position_sl, " -> New SL: ", new_sl);
+                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
                }
             }
-            else // SELL position
+            else
             {
-               // For sell positions, trail above current price by ATR multiple
-               new_sl = current_price + atr_distance;
-
-               // For ATR trailing stops on shorts, we want the lowest value (most protective for shorts)
-               // Only update if the new SL is lower than current SL or no SL is set
+               // For sell positions, trail above current price
+               new_sl = current_price + trailing_stop * _Point;
+               
+               // Only modify if new SL is lower than current SL or no SL is set
                if(position_sl == 0 || new_sl < position_sl)
                {
                   trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("ATR Trailing stop for SELL position #", position_ticket,
-                        " - Current ATR: ", current_atr, ", ATR Distance: ", atr_distance,
-                        " - Old SL: ", position_sl, " -> New SL: ", new_sl);
+                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
                }
             }
          }
