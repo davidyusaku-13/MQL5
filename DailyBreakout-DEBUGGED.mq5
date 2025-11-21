@@ -56,9 +56,8 @@ bool g_trailing_activated = false; // Default trailing status
 // Add these global variables to track ranges
 double g_max_range_ever = 0;    // Track maximum range seen
 double g_min_range_ever = 999999; // Track minimum range seen
-datetime g_max_range_date = 0;  // Date of maximum range
+datetime g_max_range_date = 0;  // Date of maximum range 
 datetime g_min_range_date = 0;  // Date of minimum range
-double g_current_range_size = 0; // Store current range size for trade reporting
 
 
 //+------------------------------------------------------------------+
@@ -93,7 +92,6 @@ void OnDeinit(const int reason)
 {
    // Clean up
    DeleteAllLines();
-   // ...existing code...
 }
 
 //+------------------------------------------------------------------+
@@ -247,9 +245,6 @@ void CalculateDailyRange()
       double range_size = g_high_price - g_low_price;
       double range_points = range_size / _Point;
       
-      // Store current range size for trade reporting
-      g_current_range_size = range_points;
-      
       // Track maximum and minimum ranges observed
       if(range_points > g_max_range_ever)
       {
@@ -262,6 +257,7 @@ void CalculateDailyRange()
          g_min_range_ever = range_points;
          g_min_range_date = TimeCurrent();
       }
+      
    }
    
    
@@ -285,8 +281,6 @@ double CalculateLotSize(double range_size)
          lot_size = min_lot;
       else if(lot_size > max_lot)
          lot_size = max_lot;
-         
-      // ...existing code...
             
       return lot_size;
    }
@@ -306,9 +300,6 @@ void PlacePendingOrders()
       
    double range_size = g_high_price - g_low_price;
    double range_points = range_size / _Point;
-   
-   // ...existing code...
-   
       
    // Check if range size is within acceptable limits
    if(max_range_size > 0 && range_points > max_range_size)
@@ -360,7 +351,6 @@ void PlacePendingOrders()
    {
       g_buy_ticket = trade.ResultOrder();
    }
-   // ...existing code...
    
    // Place sell stop order at the low of the range
    bool sell_success = trade.SellStop(
@@ -378,7 +368,6 @@ void PlacePendingOrders()
    {
       g_sell_ticket = trade.ResultOrder();
    }
-   // ...existing code...
    
    g_orders_placed = true;
 }
@@ -473,47 +462,55 @@ void ManageOrders()
 //+------------------------------------------------------------------+
 void CloseAllOrders()
 {
-    double total_pnl = 0; // Track total profit/loss
-    int positions_total = PositionsTotal();
-    for(int i = positions_total - 1; i >= 0; i--)
-    {
-       ulong position_ticket = PositionGetTicket(i);
-       if(position_ticket > 0)
-       {
-          if(PositionGetInteger(POSITION_MAGIC) == magic_number && PositionGetString(POSITION_SYMBOL) == _Symbol)
-          {
-             double position_profit = PositionGetDouble(POSITION_PROFIT);
-             total_pnl += position_profit; // Accumulate PnL
-             trade.PositionClose(position_ticket);
-             // ...existing code...
-          }
-       }
-    }
-
-    int orders_total = OrdersTotal();
-    for(int i = orders_total - 1; i >= 0; i--)
-    {
-       ulong order_ticket = OrderGetTicket(i);
-       if(order_ticket > 0)
-       {
-          if(OrderGetInteger(ORDER_MAGIC) == magic_number && OrderGetString(ORDER_SYMBOL) == _Symbol)
-          {
-             trade.OrderDelete(order_ticket);
-             // ...existing code...
-          }
-       }
-    }
-
-    // Print summary if positions were closed
-    if(total_pnl != 0)
-    {
-        PrintTradeInfo(total_pnl);
-    }
-
-    g_range_calculated = false;
-    g_orders_placed = false;
-    g_buy_ticket = 0;
-    g_sell_ticket = 0;
+   double total_pnl = 0;
+   
+   // Close all positions with this magic number
+   int positions_total = PositionsTotal();
+   for(int i = positions_total - 1; i >= 0; i--)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if(position_ticket > 0)
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == magic_number && PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            total_pnl += PositionGetDouble(POSITION_PROFIT);
+            trade.PositionClose(position_ticket);
+         }
+      }
+   }
+   
+   // Delete all pending orders with this magic number
+   int orders_total = OrdersTotal();
+   for(int i = orders_total - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket > 0)
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == magic_number && OrderGetString(ORDER_SYMBOL) == _Symbol)
+         {
+            trade.OrderDelete(order_ticket);
+         }
+      }
+   }
+   
+   // Print trade recap
+   MqlDateTime start_dt, end_dt;
+   TimeToStruct(g_range_start_time, start_dt);
+   TimeToStruct(g_range_end_time, end_dt);
+   
+   string pnl_sign = (total_pnl >= 0) ? "+" : "";
+   
+   Print("---Trade Recap---");
+   Print(StringFormat("Range Start: %02d:%02d | Range End: %02d:%02d",
+         start_dt.hour, start_dt.min, end_dt.hour, end_dt.min));
+   Print(StringFormat("PnL: %s$%.2f", pnl_sign, total_pnl));
+   Print("------------------");
+   
+   // Reset flags for next day
+   g_range_calculated = false;
+   g_orders_placed = false;
+   g_buy_ticket = 0;
+   g_sell_ticket = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -569,7 +566,6 @@ void ManageTrailingStop()
                if(position_sl == 0 || new_sl > position_sl)
                {
                   trade.PositionModify(position_ticket, new_sl, position_tp);
-                  // ...existing code...
                }
             }
             else
@@ -581,7 +577,6 @@ void ManageTrailingStop()
                if(position_sl == 0 || new_sl < position_sl)
                {
                   trade.PositionModify(position_ticket, new_sl, position_tp);
-                  // ...existing code...
                }
             }
          }
@@ -634,83 +629,4 @@ void DeleteAllLines()
    ObjectDelete(0, g_end_line_name);
    ObjectDelete(0, g_close_line_name);
    ChartRedraw();
-}
-
-//+------------------------------------------------------------------+
-//| Print trade information after closure                            |
-//+------------------------------------------------------------------+
-void PrintTradeInfo(double profit)
-{
-   // Get current account balance
-   double current_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   
-   // Format profit with +/- sign
-   string profit_str;
-   if(profit >= 0)
-       profit_str = StringFormat("+$%.2f", profit);
-   else
-       profit_str = StringFormat("-$%.2f", MathAbs(profit));
-   
-   // Print the required information
-   Print("Range: ", IntegerToString((int)g_current_range_size));
-   Print("Profit: ", profit_str);
-   Print("Current Balance: $", DoubleToString(current_balance, 2));
-   Print("----------------------------------------");
-}
-
-//+------------------------------------------------------------------+
-//| Handle trade transactions to detect closures                     |
-//+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction& trans,
-                       const MqlTradeRequest& request,
-                       const MqlTradeResult& result)
-{
-   // Check if this is a position closure
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
-   {
-       // Get the deal information
-       ulong deal_ticket = trans.deal;
-       if(HistorySelect(0, TimeCurrent()))
-       {
-           if(HistoryDealSelect(deal_ticket))
-           {
-               // Check if this deal belongs to our EA and is a closure
-               long deal_magic = HistoryDealGetInteger(deal_ticket, DEAL_MAGIC);
-               long deal_entry = HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
-               
-               if(deal_magic == magic_number &&
-                  (deal_entry == DEAL_ENTRY_OUT || deal_entry == DEAL_ENTRY_OUT_BY))
-               {
-                   // Get the profit from this closed position
-                   double deal_profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
-                   
-                   // Print the trade information
-                   PrintTradeInfo(deal_profit);
-               }
-           }
-       }
-   }
-}
-//+------------------------------------------------------------------+
-//| Custom optimization criterion function                           |
-//+------------------------------------------------------------------+
-double OnTester()
-{
-   // Get optimization statistics
-   double trades = TesterStatistics(STAT_TRADES);
-   double profit = TesterStatistics(STAT_PROFIT);
-   double expected_payoff = TesterStatistics(STAT_EXPECTED_PAYOFF);
-   double profit_factor = TesterStatistics(STAT_PROFIT_FACTOR);
-   double recovery_factor = TesterStatistics(STAT_RECOVERY_FACTOR);
-   double sharpe = TesterStatistics(STAT_SHARPE_RATIO);
-
-   // Calculate custom criterion based on modified formula (without drawdown weight)
-   double result = 0.446667 * trades +
-                   0.326667 * recovery_factor +
-                   0.111667 * profit_factor +
-                   0.049667 * sharpe +
-                   0.032667 * profit +
-                   0.031667 * expected_payoff;
-
-   return result;
 }
