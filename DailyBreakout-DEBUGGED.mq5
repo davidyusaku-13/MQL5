@@ -463,6 +463,7 @@ void ManageOrders()
 void CloseAllOrders()
 {
    double total_pnl = 0;
+   int positions_closed = 0;
    
    // Close all positions with this magic number
    int positions_total = PositionsTotal();
@@ -475,6 +476,7 @@ void CloseAllOrders()
          {
             total_pnl += PositionGetDouble(POSITION_PROFIT);
             trade.PositionClose(position_ticket);
+            positions_closed++;
          }
       }
    }
@@ -493,18 +495,25 @@ void CloseAllOrders()
       }
    }
    
-   // Print trade recap
-   MqlDateTime start_dt, end_dt;
-   TimeToStruct(g_range_start_time, start_dt);
-   TimeToStruct(g_range_end_time, end_dt);
-   
-   string pnl_sign = (total_pnl >= 0) ? "+" : "";
-   
-   Print("---Trade Recap---");
-   Print(StringFormat("Range Start: %02d:%02d | Range End: %02d:%02d",
-         start_dt.hour, start_dt.min, end_dt.hour, end_dt.min));
-   Print(StringFormat("PnL: %s$%.2f", pnl_sign, total_pnl));
-   Print("------------------");
+   // Print trade recap only if positions were actually closed
+   if(positions_closed > 0)
+   {
+      MqlDateTime start_dt, end_dt;
+      TimeToStruct(g_range_start_time, start_dt);
+      TimeToStruct(g_range_end_time, end_dt);
+      
+      string day_names[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+      string day_name = day_names[start_dt.day_of_week];
+      
+      string pnl_sign = (total_pnl >= 0) ? "+" : "";
+      
+      Print("---Trade Recap---");
+      Print(StringFormat("Day: %s", day_name));
+      Print(StringFormat("Range Start: %02d:%02d | Range End: %02d:%02d",
+            start_dt.hour, start_dt.min, end_dt.hour, end_dt.min));
+      Print(StringFormat("PnL: %s$%.2f", pnl_sign, total_pnl));
+      Print("------------------");
+   }
    
    // Reset flags for next day
    g_range_calculated = false;
