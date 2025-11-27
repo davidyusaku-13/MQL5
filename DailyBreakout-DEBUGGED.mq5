@@ -28,6 +28,7 @@ input int trailing_stop = 300;                         // Trailing Stop in point
 input int trailing_start = 500;                        // Activate trailing after profit in points
 input double max_range_size = 1500;                    // Maximum range size in points (0=off)
 input double min_range_size = 500;                     // Minimum range size in points (0=off)
+input int max_spread_points = 50;                      // Maximum spread in points (0=off)
 
 // Trend Confirmation Parameters
 input bool enable_trend_confirmation = true; // Enable multi-timeframe trend confirmation
@@ -81,6 +82,9 @@ int OnInit()
 
    // Delete any existing lines
    DeleteAllLines();
+
+   // Recover existing positions if EA restarts mid-day
+   RecoverExistingPositions();
 
    return (INIT_SUCCEEDED);
 }
@@ -270,8 +274,10 @@ int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
    double current_price = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2;
    double old_price = 0;
 
-   if (CopyClose(_Symbol, timeframe, trend_momentum_period, 1, lows) > 0) // Reuse array
-      old_price = lows[0];
+   double closes[];  // Use separate array for close prices
+   ArraySetAsSeries(closes, true);
+   if (CopyClose(_Symbol, timeframe, trend_momentum_period, 1, closes) > 0)
+      old_price = closes[0];
 
    bool recent_upward_momentum = (current_price > old_price);
 
@@ -355,6 +361,172 @@ bool ConfirmTrendDirection(bool is_bullish_breakout)
 
    return confirmed;
 }
+
+//+------------------------------------------------------------------+
+//| Optimized trend confirmation - checks both directions in one pass|
+//+------------------------------------------------------------------+
+void GetTrendConfirmation(bool &bullish_confirmed, bool &bearish_confirmed)
+{
+   bullish_confirmed = false;
+   bearish_confirmed = false;
+
+   if (!enable_trend_confirmation)
+   {
+      bullish_confirmed = true;
+      bearish_confirmed = true;
+      return;
+   }
+
+   ENUM_TIMEFRAMES timeframes[] = {PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4};
+   string timeframe_names[] = {"M5", "M15", "H1", "H4"};
+
+   int bullish_agreeing = 0;
+   int bearish_agreeing = 0;
+   int total_timeframes = ArraySize(timeframes);
+
+   Print("=== Trend Confirmation Analysis (Optimized) ===");
+
+   for (int i = 0; i < total_timeframes; i++)
+   {
+      int trend = DetectTrendBySwings(timeframes[i]);
+
+      string trend_str = "Neutral";
+      if (trend == 1)
+         trend_str = "Uptrend";
+      else if (trend == -1)
+         trend_str = "Downtrend";
+
+      Print(timeframe_names[i], " trend: ", trend_str);
+
+      // Count agreements for both directions
+      if (trend == 1)
+      {
+         bullish_agreeing++;
+         Print(timeframe_names[i], " supports bullish breakout");
+      }
+      else if (trend == -1)
+      {
+         bearish_agreeing++;
+         Print(timeframe_names[i], " supports bearish breakout");
+      }
+      else // Neutral
+      {
+         if (!require_all_timeframes)
+         {
+            bullish_agreeing++;
+            bearish_agreeing++;
+         }
+         Print(timeframe_names[i], " is neutral");
+      }
+   }
+
+   int required_timeframes = require_all_timeframes ? total_timeframes : (total_timeframes + 1) / 2;
+
+   bullish_confirmed = (bullish_agreeing >= required_timeframes);
+   bearish_confirmed = (bearish_agreeing >= required_timeframes);
+
+   Print("Bullish confirmation: ", bullish_agreeing, "/", total_timeframes,
+         " (Required: ", required_timeframes, ") - ", (bullish_confirmed ? "PASSED" : "FAILED"));
+   Print("Bearish confirmation: ", bearish_agreeing, "/", total_timeframes,
+         " (Required: ", required_timeframes, ") - ", (bearish_confirmed ? "PASSED" : "FAILED"));
+   Print("================================");
+}
+
+//+------------------------------------------------------------------+
+//| Recover existing positions if EA restarts mid-day               |
+//+------------------------------------------------------------------+
+void RecoverExistingPositions()
+{
+   Print("=== Checking for existing positions to recover ===");
+
+   int recovered_positions = 0;
+   int recovered_orders = 0;
+
+   // Check for open positions with our magic number
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if (position_ticket > 0)
+      {
+         if (PositionGetInteger(POSITION_MAGIC) == magic_number && 
+             PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            
+            if (pos_type == POSITION_TYPE_BUY)
+            {
+               g_buy_ticket = position_ticket;
+               Print("Recovered BUY position #", position_ticket);
+            }
+            else if (pos_type == POSITION_TYPE_SELL)
+            {
+               g_sell_ticket = position_ticket;
+               Print("Recovered SELL position #", position_ticket);
+            }
+            
+            recovered_positions++;
+            g_orders_placed = true;  // Mark as already placed for today
+            g_range_calculated = true;  // Assume range was calculated
+         }
+      }
+   }
+
+   // Check for pending orders with our magic number
+   for (int i = 0; i < OrdersTotal(); i++)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if (order_ticket > 0)
+      {
+         if (OrderGetInteger(ORDER_MAGIC) == magic_number && 
+             OrderGetString(ORDER_SYMBOL) == _Symbol)
+         {
+            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            
+            if (order_type == ORDER_TYPE_BUY_STOP)
+            {
+               g_buy_ticket = order_ticket;
+               g_high_price = OrderGetDouble(ORDER_PRICE_OPEN);
+               Print("Recovered BUY STOP order #", order_ticket, " at ", g_high_price);
+            }
+            else if (order_type == ORDER_TYPE_SELL_STOP)
+            {
+               g_sell_ticket = order_ticket;
+               g_low_price = OrderGetDouble(ORDER_PRICE_OPEN);
+               Print("Recovered SELL STOP order #", order_ticket, " at ", g_low_price);
+            }
+            
+            recovered_orders++;
+            g_orders_placed = true;  // Mark as already placed for today
+            g_range_calculated = true;  // Assume range was calculated
+         }
+      }
+   }
+
+   if (recovered_positions > 0 || recovered_orders > 0)
+   {
+      Print("Recovery complete: ", recovered_positions, " positions, ", recovered_orders, " pending orders");
+      
+      // Recalculate close time for today
+      if (range_close_time > 0)
+      {
+         MqlDateTime dt;
+         TimeCurrent(dt);
+         dt.hour = 0;
+         dt.min = 0;
+         dt.sec = 0;
+         datetime today = StructToTime(dt);
+         g_close_time = today + range_close_time * 60;
+         Print("Close time set to: ", TimeToString(g_close_time));
+      }
+   }
+   else
+   {
+      Print("No existing positions or orders found for this EA");
+   }
+
+   Print("================================================");
+}
+
 bool IsTradingDay()
 {
    MqlDateTime dt;
@@ -575,9 +747,21 @@ void PlacePendingOrders()
       return;
    }
 
-   // Trend Confirmation Check - Check both directions
-   bool bullish_trend_confirmed = ConfirmTrendDirection(true);  // For upward breakout
-   bool bearish_trend_confirmed = ConfirmTrendDirection(false); // For downward breakout
+   // Spread Filter Check
+   if (max_spread_points > 0)
+   {
+      long current_spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+      if (current_spread > max_spread_points)
+      {
+         Print("Current spread (", current_spread, " points) exceeds maximum (", max_spread_points, " points). Waiting for better conditions.");
+         return; // Don't mark as processed - will retry on next tick
+      }
+   }
+
+   // Trend Confirmation Check - Optimized single-pass for both directions
+   bool bullish_trend_confirmed = false;
+   bool bearish_trend_confirmed = false;
+   GetTrendConfirmation(bullish_trend_confirmed, bearish_trend_confirmed);
 
    // If neither direction has trend confirmation, skip orders for the day
    if (enable_trend_confirmation && !bullish_trend_confirmed && !bearish_trend_confirmed)
