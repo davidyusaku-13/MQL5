@@ -1,7 +1,3 @@
-//+------------------------------------------------------------------+
-//|                                            Daily Range Breakout EA |
-//|                                                                    |
-//+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
 #property link ""
 #property version "1.00"
@@ -29,6 +25,7 @@ input int trailing_start = 500;                        // Activate trailing afte
 input double max_range_size = 1500;                    // Maximum range size in points (0=off)
 input double min_range_size = 500;                     // Minimum range size in points (0=off)
 input int max_spread_points = 50;                      // Maximum spread in points (0=off)
+input double max_weekly_loss_pct = 2.5;                // Maximum weekly loss % of balance (0=off)
 
 // Trend Confirmation Parameters
 input bool enable_trend_confirmation = true; // Enable multi-timeframe trend confirmation
@@ -61,6 +58,12 @@ double g_min_range_ever = 999999; // Track minimum range seen
 datetime g_max_range_date = 0;    // Date of maximum range
 datetime g_min_range_date = 0;    // Date of minimum range
 
+// Weekly loss tracking variables
+datetime g_week_start = 0;        // Start of current trading week
+double g_weekly_closed_loss = 0;  // Accumulated closed losses this week
+double g_week_start_balance = 0;  // Balance at start of week
+bool g_weekly_limit_reached = false; // Flag when weekly limit is hit
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
@@ -82,6 +85,9 @@ int OnInit()
 
    // Delete any existing lines
    DeleteAllLines();
+
+   // Initialize weekly loss tracking
+   InitializeWeeklyTracking();
 
    // Recover existing positions if EA restarts mid-day
    RecoverExistingPositions();
@@ -134,6 +140,13 @@ void OnDeinit(const int reason)
    else
       Print("Stop Loss: Using full range as risk");
    Print("Lot calculation: Risk-based with symbol constraints");
+   if (max_weekly_loss_pct > 0)
+   {
+      Print("Max weekly loss: ", max_weekly_loss_pct, "% of balance");
+      Print("Weekly closed loss this week: $", NormalizeDouble(g_weekly_closed_loss, 2));
+   }
+   else
+      Print("Max weekly loss: DISABLED");
    Print("===============================");
 
    Print("===============================================");
@@ -162,6 +175,16 @@ void OnTick()
       g_lines_drawn = false;
       g_current_day = today;
       DeleteAllLines();
+      
+      // Check for new week (Monday)
+      CheckWeeklyReset();
+   }
+
+   // Check if weekly loss limit reached (only affects new order placement)
+   if (g_weekly_limit_reached && !g_orders_placed)
+   {
+      // Weekly limit reached - don't place new orders
+      return;
    }
 
    // Check if it's a valid trading day
@@ -209,6 +232,181 @@ void OnTick()
 //+------------------------------------------------------------------+
 //| Check if today is a valid trading day                            |
 //+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Initialize weekly loss tracking                                  |
+//+------------------------------------------------------------------+
+void InitializeWeeklyTracking()
+{
+   if (max_weekly_loss_pct <= 0)
+      return;
+
+   // Calculate start of current week (Monday 00:00)
+   g_week_start = GetWeekStartTime(TimeCurrent());
+   g_week_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_weekly_closed_loss = 0;
+   g_weekly_limit_reached = false;
+
+   // Calculate closed losses from history for this week
+   CalculateWeeklyClosedLoss();
+
+   Print("=== Weekly Loss Tracking Initialized ===");
+   Print("Week start: ", TimeToString(g_week_start));
+   Print("Week start balance: $", NormalizeDouble(g_week_start_balance, 2));
+   Print("Weekly closed loss so far: $", NormalizeDouble(g_weekly_closed_loss, 2));
+   Print("Weekly loss limit: ", max_weekly_loss_pct, "% ($", NormalizeDouble(g_week_start_balance * max_weekly_loss_pct / 100, 2), ")");
+   Print("========================================");
+}
+
+//+------------------------------------------------------------------+
+//| Get the start time of the week (Monday 00:00)                    |
+//+------------------------------------------------------------------+
+datetime GetWeekStartTime(datetime time)
+{
+   MqlDateTime dt;
+   TimeToStruct(time, dt);
+   
+   // Calculate days since Monday (Monday = 1, Sunday = 0)
+   int days_since_monday = dt.day_of_week - 1;
+   if (days_since_monday < 0)
+      days_since_monday = 6; // Sunday
+   
+   // Reset to Monday 00:00
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
+   
+   datetime result = StructToTime(dt) - days_since_monday * 86400; // 86400 seconds per day
+   return result;
+}
+
+//+------------------------------------------------------------------+
+//| Check if we need to reset for a new week                         |
+//+------------------------------------------------------------------+
+void CheckWeeklyReset()
+{
+   if (max_weekly_loss_pct <= 0)
+      return;
+
+   datetime current_week_start = GetWeekStartTime(TimeCurrent());
+   
+   if (current_week_start > g_week_start)
+   {
+      // New week has started
+      Print("=== New Trading Week Started ===");
+      Print("Previous week closed loss: $", NormalizeDouble(g_weekly_closed_loss, 2));
+      
+      g_week_start = current_week_start;
+      g_week_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_weekly_closed_loss = 0;
+      g_weekly_limit_reached = false;
+      
+      Print("New week start balance: $", NormalizeDouble(g_week_start_balance, 2));
+      Print("Weekly loss limit reset: ", max_weekly_loss_pct, "% ($", NormalizeDouble(g_week_start_balance * max_weekly_loss_pct / 100, 2), ")");
+      Print("================================");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate weekly closed loss from trade history                  |
+//+------------------------------------------------------------------+
+void CalculateWeeklyClosedLoss()
+{
+   if (max_weekly_loss_pct <= 0)
+      return;
+
+   g_weekly_closed_loss = 0;
+   
+   // Select history from week start to now
+   if (!HistorySelect(g_week_start, TimeCurrent()))
+   {
+      Print("Warning: Could not select trade history for weekly loss calculation");
+      return;
+   }
+   
+   int total_deals = HistoryDealsTotal();
+   
+   for (int i = 0; i < total_deals; i++)
+   {
+      ulong deal_ticket = HistoryDealGetTicket(i);
+      if (deal_ticket > 0)
+      {
+         // Check if this deal belongs to our EA
+         if (HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) == magic_number &&
+             HistoryDealGetString(deal_ticket, DEAL_SYMBOL) == _Symbol)
+         {
+            // Only count exit deals (DEAL_ENTRY_OUT)
+            ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+            if (deal_entry == DEAL_ENTRY_OUT || deal_entry == DEAL_ENTRY_INOUT)
+            {
+               double deal_profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+               double deal_swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+               double deal_commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+               
+               double total_pnl = deal_profit + deal_swap + deal_commission;
+               
+               // Only track losses (negative PnL)
+               if (total_pnl < 0)
+               {
+                  g_weekly_closed_loss += MathAbs(total_pnl);
+               }
+            }
+         }
+      }
+   }
+   
+   // Check if weekly limit is already reached
+   CheckWeeklyLossLimit();
+}
+
+//+------------------------------------------------------------------+
+//| Check if weekly loss limit has been reached                      |
+//+------------------------------------------------------------------+
+void CheckWeeklyLossLimit()
+{
+   if (max_weekly_loss_pct <= 0)
+   {
+      g_weekly_limit_reached = false;
+      return;
+   }
+   
+   double max_weekly_loss_amount = g_week_start_balance * max_weekly_loss_pct / 100;
+   
+   if (g_weekly_closed_loss >= max_weekly_loss_amount)
+   {
+      if (!g_weekly_limit_reached)
+      {
+         g_weekly_limit_reached = true;
+         Print("!!! WEEKLY LOSS LIMIT REACHED !!!");
+         Print("Weekly closed loss: $", NormalizeDouble(g_weekly_closed_loss, 2));
+         Print("Weekly limit: $", NormalizeDouble(max_weekly_loss_amount, 2), " (", max_weekly_loss_pct, "% of $", NormalizeDouble(g_week_start_balance, 2), ")");
+         Print("No new trades will be opened until next week.");
+      }
+   }
+   else
+   {
+      g_weekly_limit_reached = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update weekly loss after a trade closes                          |
+//+------------------------------------------------------------------+
+void UpdateWeeklyLossOnClose(double closed_pnl)
+{
+   if (max_weekly_loss_pct <= 0)
+      return;
+   
+   // Only track losses
+   if (closed_pnl < 0)
+   {
+      g_weekly_closed_loss += MathAbs(closed_pnl);
+      Print("Weekly closed loss updated: $", NormalizeDouble(g_weekly_closed_loss, 2));
+      
+      // Check if limit is now reached
+      CheckWeeklyLossLimit();
+   }
+}
 
 //+------------------------------------------------------------------+
 //| Detect trend based on higher highs/lower lows pattern           |
@@ -722,6 +920,14 @@ void PlacePendingOrders()
    if (g_high_price <= 0 || g_low_price >= 99999999)
       return;
 
+   // Check weekly loss limit before placing orders
+   if (max_weekly_loss_pct > 0 && g_weekly_limit_reached)
+   {
+      Print("Weekly loss limit reached - no new orders will be placed until next week");
+      g_orders_placed = true; // Mark as processed so we don't try again today
+      return;
+   }
+
    double range_size = g_high_price - g_low_price;
    double range_points = range_size / _Point;
 
@@ -950,9 +1156,14 @@ void CloseAllOrders()
       {
          if (PositionGetInteger(POSITION_MAGIC) == magic_number && PositionGetString(POSITION_SYMBOL) == _Symbol)
          {
+            // Get position profit before closing (commission will be retrieved from deal after close)
+            double position_profit = PositionGetDouble(POSITION_PROFIT);
+            double position_swap = PositionGetDouble(POSITION_SWAP);
+            
             trade.PositionClose(position_ticket);
             if (trade.ResultRetcode() != TRADE_RETCODE_DONE)
                Print("Failed to close position #", position_ticket, ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+            // Note: Weekly loss tracking is handled by OnTradeTransaction event
          }
       }
    }
@@ -1049,6 +1260,50 @@ void ManageTrailingStop()
          }
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| Trade transaction event handler                                  |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   // Only process deal additions (closed trades)
+   if (trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   
+   // Get deal information
+   ulong deal_ticket = trans.deal;
+   if (deal_ticket == 0)
+      return;
+   
+   // Select the deal from history
+   if (!HistoryDealSelect(deal_ticket))
+      return;
+   
+   // Check if this deal belongs to our EA
+   if (HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != magic_number)
+      return;
+   
+   if (HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol)
+      return;
+   
+   // Only process exit deals
+   ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+   if (deal_entry != DEAL_ENTRY_OUT && deal_entry != DEAL_ENTRY_INOUT)
+      return;
+   
+   // Calculate total PnL for this deal
+   double deal_profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+   double deal_swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+   double deal_commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+   double total_pnl = deal_profit + deal_swap + deal_commission;
+   
+   Print("Trade closed - Deal #", deal_ticket, " PnL: $", NormalizeDouble(total_pnl, 2));
+   
+   // Update weekly loss tracking
+   UpdateWeeklyLossOnClose(total_pnl);
 }
 
 //+------------------------------------------------------------------+
