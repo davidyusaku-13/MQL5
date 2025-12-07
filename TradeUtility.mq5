@@ -45,6 +45,7 @@ private:
    CLabel            m_lblTP4;
    CLabel            m_lblTP4Value;
    CLabel            m_lblBreakeven;
+   CLabel            m_lblDataStatus;      // Visual feedback: "Saved" or "Default"
 
    // Display fields
    CEdit             m_edtSymbol;
@@ -74,18 +75,14 @@ private:
    int               m_orderCount;
    int               m_fontSize;
 
-   // Symbol change detection and input preservation
+   // Symbol change detection
    string            m_currentSymbol;
-   string            m_savedRiskPercent;
-   string            m_savedOrderType;
-   string            m_savedEntryPrice;
-   string            m_savedOrderCount;
-   string            m_savedSL;
-   string            m_savedTP1;
-   string            m_savedTP2;
-   string            m_savedTP3;
-   string            m_savedTP4;
-   string            m_savedBreakeven;
+   
+   // Debounced save tracking
+   bool              m_inputsDirty;         // Flag indicating unsaved changes
+   datetime          m_lastInputChangeTime; // Time of last input modification
+   int               m_debounceSeconds;     // Debounce delay (default 3 seconds)
+   bool              m_dataLoadedFromDisk;  // Track if current data was loaded vs defaults
 
    // Breakeven tracking structures
    struct TradeSetup
@@ -117,10 +114,12 @@ public:
    void              LoadSetupsFromDisk();
    void              RefreshSetupsFromOrders();
    void              PeriodicSave();
-   void              SaveInputValues();
-   void              RestoreInputValues();
    void              SaveInputsToDisk();
    void              LoadInputsFromDisk();
+   void              MarkInputsDirty();
+   void              DebouncedSave();
+   void              UpdateDataStatusLabel();
+   bool              ValidateInputData(string riskPercent, string entryPrice, string sl, string tp1, string tp2, string tp3, string tp4);
 
 protected:
    virtual bool      CreateControls();
@@ -158,18 +157,12 @@ CTradeUtilityDialog::CTradeUtilityDialog()
    m_lastSaveTime = 0;
    m_saveIntervalSeconds = AutoSaveIntervalSeconds;  // From input parameter
    
-   // Initialize symbol tracking (defaults - will be loaded from disk if available)
+   // Initialize symbol tracking and debounce
    m_currentSymbol = _Symbol;
-   m_savedRiskPercent = "1.0";
-   m_savedOrderType = "MARKET";
-   m_savedEntryPrice = "0.00000";
-   m_savedOrderCount = "2";
-   m_savedSL = "0.00";
-   m_savedTP1 = "0.00";
-   m_savedTP2 = "0.00";
-   m_savedTP3 = "0.00";
-   m_savedTP4 = "0.00";
-   m_savedBreakeven = "After TP1";
+   m_inputsDirty = false;
+   m_lastInputChangeTime = 0;
+   m_debounceSeconds = 3;  // Save 3 seconds after last input change
+   m_dataLoadedFromDisk = false;
 }
 
 //+------------------------------------------------------------------+
@@ -210,8 +203,8 @@ bool CTradeUtilityDialog::Create(const long chart, const string name, const int 
    // Load saved inputs from disk for current symbol
    LoadInputsFromDisk();
    
-   // Restore the loaded values to UI
-   RestoreInputValues();
+   // Update visual feedback
+   UpdateDataStatusLabel();
    
    UpdateButtonLabels();
    UpdateTPFields();
@@ -511,6 +504,17 @@ bool CTradeUtilityDialog::CreateControls()
    m_cmbBreakeven.Select(1);
    SetComboBoxFontSize(m_cmbBreakeven, m_fontSize);
    if(!Add(m_cmbBreakeven))
+      return false;
+
+   y += row_height;
+
+   // Data Status Label (visual feedback)
+   if(!m_lblDataStatus.Create(m_chart_id, m_name+"LblDataStatus", m_subwin, x1, y, x4, y+20))
+      return false;
+   m_lblDataStatus.Text("⚫ Default Values");
+   m_lblDataStatus.Color(clrGray);
+   m_lblDataStatus.FontSize(m_fontSize - 1);
+   if(!Add(m_lblDataStatus))
       return false;
 
    y += row_height + 10;
@@ -1231,6 +1235,9 @@ void CTradeUtilityDialog::CleanupCompletedSetups()
 
          m_setupCount--;
          ArrayResize(m_tradeSetups, m_setupCount);
+         
+         // SYNC: Save to disk immediately to reflect cleanup
+         SaveSetupsToDisk();
       }
    }
 }
@@ -1901,72 +1908,73 @@ void CTradeUtilityDialog::ProcessBreakeven()
 }
 
 //+------------------------------------------------------------------+
-//| Save current input values to memory                              |
+//| Mark inputs as dirty (needs save)                                |
 //+------------------------------------------------------------------+
-void CTradeUtilityDialog::SaveInputValues()
+void CTradeUtilityDialog::MarkInputsDirty()
 {
-   // Use .Text() method consistently for all input fields
-   m_savedRiskPercent = m_edtRiskPercent.Text();
-   m_savedOrderType = m_cmbOrderType.Select();
-   m_savedEntryPrice = m_edtEntryPrice.Text();
-   m_savedOrderCount = m_cmbOrderCount.Select();
-   m_savedSL = m_edtSL.Text();
-   m_savedTP1 = m_edtTP1.Text();
-   m_savedTP2 = m_edtTP2.Text();
-   m_savedTP3 = m_edtTP3.Text();
-   m_savedTP4 = m_edtTP4.Text();
-   m_savedBreakeven = m_cmbBreakeven.Select();
-   
-   // Save to disk immediately
-   SaveInputsToDisk();
+   m_inputsDirty = true;
+   m_lastInputChangeTime = TimeCurrent();
 }
 
 //+------------------------------------------------------------------+
-//| Restore saved input values from memory to UI                     |
+//| Debounced save - only save after inactivity period               |
 //+------------------------------------------------------------------+
-void CTradeUtilityDialog::RestoreInputValues()
+void CTradeUtilityDialog::DebouncedSave()
 {
-   m_edtRiskPercent.Text(m_savedRiskPercent);
+   if(!m_inputsDirty)
+      return;
    
-   // Restore order type combo box
-   if(m_savedOrderType == "MARKET")
-      m_cmbOrderType.Select(0);
+   datetime currentTime = TimeCurrent();
+   
+   // Check if debounce period has elapsed
+   if(currentTime - m_lastInputChangeTime >= m_debounceSeconds)
+   {
+      SaveInputsToDisk();
+      m_inputsDirty = false;
+      Print("Debounced save completed for ", m_currentSymbol);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update visual feedback label                                     |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::UpdateDataStatusLabel()
+{
+   if(m_dataLoadedFromDisk)
+   {
+      m_lblDataStatus.Text("✓ Saved Settings");
+      m_lblDataStatus.Color(clrLimeGreen);
+   }
    else
-      m_cmbOrderType.Select(1);
-   OnChangeOrderType();
+   {
+      m_lblDataStatus.Text("⚫ Default Values");
+      m_lblDataStatus.Color(clrGray);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Validate input data                                              |
+//+------------------------------------------------------------------+
+bool CTradeUtilityDialog::ValidateInputData(string riskPercent, string entryPrice, string sl, string tp1, string tp2, string tp3, string tp4)
+{
+   // Validate risk percent
+   double risk = StringToDouble(riskPercent);
+   if(risk < 0.01 || risk > 100.0)
+   {
+      Print("WARNING: Invalid risk percent loaded: ", risk, " - resetting to 1.0%");
+      return false;
+   }
    
-   // IMPORTANT: Restore Entry Price AFTER OnChangeOrderType() 
-   // OnChangeOrderType() now preserves existing values (only resets empty fields)
-   m_edtEntryPrice.Text(m_savedEntryPrice);
+   // Validate prices are non-negative
+   if(StringToDouble(entryPrice) < 0 || StringToDouble(sl) < 0 ||
+      StringToDouble(tp1) < 0 || StringToDouble(tp2) < 0 ||
+      StringToDouble(tp3) < 0 || StringToDouble(tp4) < 0)
+   {
+      Print("WARNING: Negative price values detected - using defaults");
+      return false;
+   }
    
-   // Restore order count combo box
-   if(m_savedOrderCount == "1")
-      m_cmbOrderCount.Select(0);
-   else if(m_savedOrderCount == "2")
-      m_cmbOrderCount.Select(1);
-   else if(m_savedOrderCount == "3")
-      m_cmbOrderCount.Select(2);
-   else if(m_savedOrderCount == "4")
-      m_cmbOrderCount.Select(3);
-   OnChangeOrderCount();
-   
-   m_edtSL.Text(m_savedSL);
-   m_edtTP1.Text(m_savedTP1);
-   m_edtTP2.Text(m_savedTP2);
-   m_edtTP3.Text(m_savedTP3);
-   m_edtTP4.Text(m_savedTP4);
-   
-   // Restore breakeven combo box
-   if(m_savedBreakeven == "Disabled")
-      m_cmbBreakeven.Select(0);
-   else if(m_savedBreakeven == "After TP1")
-      m_cmbBreakeven.Select(1);
-   else if(m_savedBreakeven == "After TP2")
-      m_cmbBreakeven.Select(2);
-   
-   // Recalculate lot size and dollar values after restoring
-   CalculateLotSize();
-   UpdateDollarValues();
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -2137,13 +2145,17 @@ void CTradeUtilityDialog::LoadInputsFromDisk()
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::OnTick()
 {
-   // Detect symbol change
+   // Detect symbol change (ChartEvent-based detection is better, but OnTick is backup)
    if(_Symbol != m_currentSymbol)
    {
       Print("Symbol changed from ", m_currentSymbol, " to ", _Symbol);
       
-      // IMPORTANT: Save OLD symbol's inputs before switching
-      SaveInputValues();
+      // Save OLD symbol's inputs if dirty
+      if(m_inputsDirty)
+      {
+         SaveInputsToDisk();
+         m_inputsDirty = false;
+      }
       
       // Update to new symbol
       m_currentSymbol = _Symbol;
@@ -2151,11 +2163,11 @@ void CTradeUtilityDialog::OnTick()
       // Update symbol info
       UpdateSymbolInfo();
       
-      // Load saved inputs from disk for new symbol (resets to defaults if not found)
+      // Load saved inputs from disk for new symbol
       LoadInputsFromDisk();
       
-      // Restore the loaded values to UI
-      RestoreInputValues();
+      // Update visual feedback
+      UpdateDataStatusLabel();
       
       // Recalculate
       CalculateLotSize();
@@ -2216,27 +2228,29 @@ bool CTradeUtilityDialog::OnEvent(const int id, const long &lparam, const double
       if(sparam == m_cmbOrderType.Name())
       {
          OnChangeOrderType();
-         SaveInputValues();  // Save to disk
+         MarkInputsDirty();
          return true;
       }
 
       if(sparam == m_cmbOrderCount.Name())
       {
          OnChangeOrderCount();
-         SaveInputValues();  // Save to disk
+         MarkInputsDirty();
          return true;
       }
       
       if(sparam == m_cmbBreakeven.Name())
       {
-         SaveInputValues();  // Save to disk
-         return true;
+         MarkInputsDirty();
       }
    }
 
    // Event ID 1 = CHARTEVENT_OBJECT_ENDEDIT (when user finishes editing a field)
    if(id == CHARTEVENT_OBJECT_ENDEDIT)
    {
+      // Mark inputs as dirty for any field change
+      MarkInputsDirty();
+      
       // Recalculate lot size when Risk %, SL, or Entry Price changes
       if(sparam == m_edtRiskPercent.Name() ||
          sparam == m_edtSL.Name() ||
@@ -2244,7 +2258,6 @@ bool CTradeUtilityDialog::OnEvent(const int id, const long &lparam, const double
       {
          CalculateLotSize();
          UpdateDollarValues();
-         SaveInputValues();  // Save to disk
          return true;
       }
 
@@ -2298,7 +2311,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    // Save current input values to disk before shutdown (important for timeframe changes)
-   AppWindow.SaveInputValues();
+   AppWindow.SaveInputsToDisk();
    
    // Save setups to disk before shutdown
    AppWindow.SaveSetupsToDisk();
@@ -2329,7 +2342,10 @@ void OnTimer()
    // Periodically cleanup completed setups (positions that were closed)
    AppWindow.CleanupCompletedSetups();
 
-   // Periodic save (every 30 seconds by default)
+   // Debounced save (only if inputs changed and debounce period elapsed)
+   AppWindow.DebouncedSave();
+   
+   // Periodic save for setups (every 30 seconds by default)
    AppWindow.PeriodicSave();
 }
 
@@ -2341,6 +2357,13 @@ void OnChartEvent(const int id,
                   const double &dparam,
                   const string &sparam)
 {
+   // Detect symbol change via ChartEvent (more reliable than OnTick polling)
+   if(id == CHARTEVENT_CHART_CHANGE)
+   {
+      // Trigger OnTick to handle symbol change logic
+      AppWindow.OnTick();
+   }
+   
    // Pass events to the panel
    AppWindow.ChartEvent(id, lparam, dparam, sparam);
 }
