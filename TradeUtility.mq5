@@ -78,11 +78,15 @@ private:
    // Symbol change detection
    string            m_currentSymbol;
    
+   // Price change tracking for performance optimization
+   double            m_lastBidPrice;        // Track last bid to avoid redundant updates
+   
    // Debounced save tracking
    bool              m_inputsDirty;         // Flag indicating unsaved changes
    datetime          m_lastInputChangeTime; // Time of last input modification
    int               m_debounceSeconds;     // Debounce delay (default 3 seconds)
    bool              m_dataLoadedFromDisk;  // Track if current data was loaded vs defaults
+   bool              m_setupsDirty;         // Flag for batched setup saves
 
    // Breakeven tracking structures
    struct TradeSetup
@@ -120,6 +124,7 @@ public:
    void              DebouncedSave();
    void              UpdateDataStatusLabel();
    bool              ValidateInputData(string riskPercent, string entryPrice, string sl, string tp1, string tp2, string tp3, string tp4);
+   void              ApplyInputsToUI(string riskPercent, string orderType, string entryPrice, string orderCount, string sl, string tp1, string tp2, string tp3, string tp4, string breakeven);
 
 protected:
    virtual bool      CreateControls();
@@ -132,6 +137,7 @@ protected:
    void              UpdateDollarValues();
    void              OnClickBuy();
    void              OnClickSell();
+   void              ExecuteTrade(bool isBuy);
    void              OnClickCancelAll();
    void              OnClickCloseAll();
    void              ProcessBreakeven();
@@ -159,10 +165,12 @@ CTradeUtilityDialog::CTradeUtilityDialog()
    
    // Initialize symbol tracking and debounce
    m_currentSymbol = _Symbol;
+   m_lastBidPrice = 0;
    m_inputsDirty = false;
    m_lastInputChangeTime = 0;
    m_debounceSeconds = 3;  // Save 3 seconds after last input change
    m_dataLoadedFromDisk = false;
+   m_setupsDirty = false;
 }
 
 //+------------------------------------------------------------------+
@@ -1236,8 +1244,8 @@ void CTradeUtilityDialog::CleanupCompletedSetups()
          m_setupCount--;
          ArrayResize(m_tradeSetups, m_setupCount);
          
-         // SYNC: Save to disk immediately to reflect cleanup
-         SaveSetupsToDisk();
+         // Mark dirty for batched save
+         m_setupsDirty = true;
       }
    }
 }
@@ -1452,24 +1460,30 @@ void CTradeUtilityDialog::RefreshSetupsFromOrders()
 void CTradeUtilityDialog::PeriodicSave()
 {
    // Skip if auto-save is disabled (interval set to 0)
-   if(m_saveIntervalSeconds <= 0)
+   if(m_saveIntervalSeconds <= 0 && !m_setupsDirty)
       return;
 
    datetime currentTime = TimeCurrent();
 
-   // Check if enough time has passed since last save
-   if(currentTime - m_lastSaveTime >= m_saveIntervalSeconds)
+   // Save immediately if dirty, or on regular interval
+   bool shouldSave = m_setupsDirty || (m_saveIntervalSeconds > 0 && currentTime - m_lastSaveTime >= m_saveIntervalSeconds);
+   
+   if(shouldSave && m_setupCount > 0)
    {
-      if(m_setupCount > 0)
-      {
-         // Refresh TP values from orders before saving
-         RefreshSetupsFromOrders();
+      // Refresh TP values from orders before saving
+      RefreshSetupsFromOrders();
 
-         // Save to disk
-         SaveSetupsToDisk();
+      // Save to disk
+      SaveSetupsToDisk();
 
-         m_lastSaveTime = currentTime;
-      }
+      m_lastSaveTime = currentTime;
+      m_setupsDirty = false;
+   }
+   else if(shouldSave && m_setupCount == 0 && m_setupsDirty)
+   {
+      // Save empty state to disk
+      SaveSetupsToDisk();
+      m_setupsDirty = false;
    }
 }
 
@@ -1500,97 +1514,7 @@ bool CTradeUtilityDialog::ValidatePendingPrice(bool isBuy, double entryPrice)
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::OnClickBuy()
 {
-   CTrade trade;
-
-   // Get trade parameters
-   double entryPrice = StringToDouble(m_edtEntryPrice.Text());
-   double lotSize = StringToDouble(m_edtLotSize.Text());
-   double slPrice = StringToDouble(m_edtSL.Text());
-   double tp1Price = StringToDouble(m_edtTP1.Text());
-   double tp2Price = StringToDouble(m_edtTP2.Text());
-   double tp3Price = StringToDouble(m_edtTP3.Text());
-   double tp4Price = StringToDouble(m_edtTP4.Text());
-
-   // Validate lot size
-   if(lotSize <= 0)
-   {
-      Alert("Invalid lot size. Please check your risk settings and SL.");
-      return;
-   }
-
-   // For PENDING orders, validate entry price
-   if(!m_isMarketOrder)
-   {
-      if(entryPrice <= 0)
-      {
-         Alert("Please enter a valid entry price for LIMIT order.");
-         return;
-      }
-
-      if(!ValidatePendingPrice(true, entryPrice))
-         return;
-   }
-
-   // Generate unique magic number for this trade setup (symbol-specific range)
-   ulong magicNumber = GetMagicNumberForSymbol(_Symbol);
-
-   // Store this trade setup information for breakeven tracking
-   TradeSetup newSetup;
-   newSetup.symbol = _Symbol;           // Store the symbol for this setup
-   newSetup.magicNumber = magicNumber;
-   newSetup.tp1 = tp1Price;
-   newSetup.tp2 = tp2Price;
-   newSetup.beMode = m_cmbBreakeven.Select();
-   newSetup.beActivated = false;
-
-   // Add to array
-   ArrayResize(m_tradeSetups, m_setupCount + 1);
-   m_tradeSetups[m_setupCount] = newSetup;
-   m_setupCount++;
-
-   // Save to disk immediately after adding new setup
-   SaveSetupsToDisk();
-
-   // Set magic number for CTrade
-   trade.SetExpertMagicNumber(magicNumber);
-
-   // Place orders based on order count
-   for(int i = 0; i < m_orderCount; i++)
-   {
-      double tpPrice = 0;
-
-      // Assign TP based on order index
-      if(i == 0 && tp1Price > 0) tpPrice = tp1Price;
-      else if(i == 1 && tp2Price > 0) tpPrice = tp2Price;
-      else if(i == 2 && tp3Price > 0) tpPrice = tp3Price;
-      else if(i == 3 && tp4Price > 0) tpPrice = tp4Price;
-
-      // Simple readable comment: "TradeUtility BTCUSD #1"
-      string comment = "TradeUtility " + _Symbol + " #" + IntegerToString(i + 1);
-
-      bool result = false;
-      if(m_isMarketOrder)
-      {
-         // Market order - use current ASK price
-         result = trade.Buy(lotSize, _Symbol, 0, slPrice, tpPrice, comment);
-      }
-      else
-      {
-         // Pending LIMIT order
-         result = trade.BuyLimit(lotSize, entryPrice, _Symbol, slPrice, tpPrice, ORDER_TIME_GTC, 0, comment);
-      }
-
-      if(result)
-      {
-         Print("BUY Order #", i + 1, " placed successfully. Ticket: ", trade.ResultOrder());
-      }
-      else
-      {
-         Alert("Failed to place BUY order #", i + 1, ". Error: ", trade.ResultRetcodeDescription());
-      }
-   }
-
-   Print("Trade execution completed. ", m_orderCount, " BUY order(s) placed.");
+   ExecuteTrade(true);
 }
 
 //+------------------------------------------------------------------+
@@ -1598,16 +1522,26 @@ void CTradeUtilityDialog::OnClickBuy()
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::OnClickSell()
 {
+   ExecuteTrade(false);
+}
+
+//+------------------------------------------------------------------+
+//| Execute trade (unified BUY/SELL logic)                           |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::ExecuteTrade(bool isBuy)
+{
+   string tradeType = isBuy ? "BUY" : "SELL";
    CTrade trade;
 
    // Get trade parameters
    double entryPrice = StringToDouble(m_edtEntryPrice.Text());
    double lotSize = StringToDouble(m_edtLotSize.Text());
    double slPrice = StringToDouble(m_edtSL.Text());
-   double tp1Price = StringToDouble(m_edtTP1.Text());
-   double tp2Price = StringToDouble(m_edtTP2.Text());
-   double tp3Price = StringToDouble(m_edtTP3.Text());
-   double tp4Price = StringToDouble(m_edtTP4.Text());
+   double tpPrices[4];
+   tpPrices[0] = StringToDouble(m_edtTP1.Text());
+   tpPrices[1] = StringToDouble(m_edtTP2.Text());
+   tpPrices[2] = StringToDouble(m_edtTP3.Text());
+   tpPrices[3] = StringToDouble(m_edtTP4.Text());
 
    // Validate lot size
    if(lotSize <= 0)
@@ -1625,7 +1559,7 @@ void CTradeUtilityDialog::OnClickSell()
          return;
       }
 
-      if(!ValidatePendingPrice(false, entryPrice))
+      if(!ValidatePendingPrice(isBuy, entryPrice))
          return;
    }
 
@@ -1634,20 +1568,20 @@ void CTradeUtilityDialog::OnClickSell()
 
    // Store this trade setup information for breakeven tracking
    TradeSetup newSetup;
-   newSetup.symbol = _Symbol;           // Store the symbol for this setup
+   newSetup.symbol = _Symbol;
    newSetup.magicNumber = magicNumber;
-   newSetup.tp1 = tp1Price;
-   newSetup.tp2 = tp2Price;
+   newSetup.tp1 = tpPrices[0];
+   newSetup.tp2 = tpPrices[1];
    newSetup.beMode = m_cmbBreakeven.Select();
    newSetup.beActivated = false;
 
-   // Add to array
-   ArrayResize(m_tradeSetups, m_setupCount + 1);
+   // Add to array with reserve capacity for efficiency
+   ArrayResize(m_tradeSetups, m_setupCount + 1, 10);
    m_tradeSetups[m_setupCount] = newSetup;
    m_setupCount++;
 
-   // Save to disk immediately after adding new setup
-   SaveSetupsToDisk();
+   // Mark setups as dirty for batched save (will be saved by PeriodicSave)
+   m_setupsDirty = true;
 
    // Set magic number for CTrade
    trade.SetExpertMagicNumber(magicNumber);
@@ -1655,40 +1589,29 @@ void CTradeUtilityDialog::OnClickSell()
    // Place orders based on order count
    for(int i = 0; i < m_orderCount; i++)
    {
-      double tpPrice = 0;
+      double tpPrice = (i < 4 && tpPrices[i] > 0) ? tpPrices[i] : 0;
 
-      // Assign TP based on order index
-      if(i == 0 && tp1Price > 0) tpPrice = tp1Price;
-      else if(i == 1 && tp2Price > 0) tpPrice = tp2Price;
-      else if(i == 2 && tp3Price > 0) tpPrice = tp3Price;
-      else if(i == 3 && tp4Price > 0) tpPrice = tp4Price;
-
-      // Simple readable comment: "TradeUtility BTCUSD #1"
       string comment = "TradeUtility " + _Symbol + " #" + IntegerToString(i + 1);
 
       bool result = false;
       if(m_isMarketOrder)
       {
-         // Market order - use current BID price
-         result = trade.Sell(lotSize, _Symbol, 0, slPrice, tpPrice, comment);
+         result = isBuy ? trade.Buy(lotSize, _Symbol, 0, slPrice, tpPrice, comment)
+                        : trade.Sell(lotSize, _Symbol, 0, slPrice, tpPrice, comment);
       }
       else
       {
-         // Pending LIMIT order
-         result = trade.SellLimit(lotSize, entryPrice, _Symbol, slPrice, tpPrice, ORDER_TIME_GTC, 0, comment);
+         result = isBuy ? trade.BuyLimit(lotSize, entryPrice, _Symbol, slPrice, tpPrice, ORDER_TIME_GTC, 0, comment)
+                        : trade.SellLimit(lotSize, entryPrice, _Symbol, slPrice, tpPrice, ORDER_TIME_GTC, 0, comment);
       }
 
       if(result)
-      {
-         Print("SELL Order #", i + 1, " placed successfully. Ticket: ", trade.ResultOrder());
-      }
+         Print(tradeType, " Order #", i + 1, " placed successfully. Ticket: ", trade.ResultOrder());
       else
-      {
-         Alert("Failed to place SELL order #", i + 1, ". Error: ", trade.ResultRetcodeDescription());
-      }
+         Alert("Failed to place ", tradeType, " order #", i + 1, ". Error: ", trade.ResultRetcodeDescription());
    }
 
-   Print("Trade execution completed. ", m_orderCount, " SELL order(s) placed.");
+   Print("Trade execution completed. ", m_orderCount, " ", tradeType, " order(s) placed.");
 }
 
 //+------------------------------------------------------------------+
@@ -1900,8 +1823,8 @@ void CTradeUtilityDialog::ProcessBreakeven()
             m_tradeSetups[s].beActivated = true;
             Print("Breakeven activated for setup #", s+1, " [", m_tradeSetups[s].symbol, "]. ", movedCount, " position(s) moved to breakeven (", m_tradeSetups[s].beMode, ", Magic: ", m_tradeSetups[s].magicNumber, ")");
 
-            // Save to disk after breakeven activation
-            SaveSetupsToDisk();
+            // Mark dirty for batched save
+            m_setupsDirty = true;
          }
       }
    }
@@ -1982,6 +1905,18 @@ bool CTradeUtilityDialog::ValidateInputData(string riskPercent, string entryPric
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::SaveInputsToDisk()
 {
+   // Read current values directly from UI controls
+   string riskPercent = m_edtRiskPercent.Text();
+   string orderType = m_cmbOrderType.Select();
+   string entryPrice = m_edtEntryPrice.Text();
+   string orderCount = m_cmbOrderCount.Select();
+   string sl = m_edtSL.Text();
+   string tp1 = m_edtTP1.Text();
+   string tp2 = m_edtTP2.Text();
+   string tp3 = m_edtTP3.Text();
+   string tp4 = m_edtTP4.Text();
+   string breakeven = m_cmbBreakeven.Select();
+   
    // Read existing file and update only current symbol's entry
    string lines[];
    int lineCount = 0;
@@ -2012,18 +1947,18 @@ void CTradeUtilityDialog::SaveInputsToDisk()
                
                if(fieldCount > 0 && fields[0] == m_currentSymbol)
                {
-                  // Update this symbol's line
+                  // Update this symbol's line with current UI values
                   string newLine = m_currentSymbol + ",";
-                  newLine += m_savedRiskPercent + ",";
-                  newLine += m_savedOrderType + ",";
-                  newLine += m_savedEntryPrice + ",";
-                  newLine += m_savedOrderCount + ",";
-                  newLine += m_savedSL + ",";
-                  newLine += m_savedTP1 + ",";
-                  newLine += m_savedTP2 + ",";
-                  newLine += m_savedTP3 + ",";
-                  newLine += m_savedTP4 + ",";
-                  newLine += m_savedBreakeven;
+                  newLine += riskPercent + ",";
+                  newLine += orderType + ",";
+                  newLine += entryPrice + ",";
+                  newLine += orderCount + ",";
+                  newLine += sl + ",";
+                  newLine += tp1 + ",";
+                  newLine += tp2 + ",";
+                  newLine += tp3 + ",";
+                  newLine += tp4 + ",";
+                  newLine += breakeven;
                   
                   ArrayResize(lines, lineCount + 1);
                   lines[lineCount] = newLine;
@@ -2054,16 +1989,16 @@ void CTradeUtilityDialog::SaveInputsToDisk()
    if(!symbolFound)
    {
       string newLine = m_currentSymbol + ",";
-      newLine += m_savedRiskPercent + ",";
-      newLine += m_savedOrderType + ",";
-      newLine += m_savedEntryPrice + ",";
-      newLine += m_savedOrderCount + ",";
-      newLine += m_savedSL + ",";
-      newLine += m_savedTP1 + ",";
-      newLine += m_savedTP2 + ",";
-      newLine += m_savedTP3 + ",";
-      newLine += m_savedTP4 + ",";
-      newLine += m_savedBreakeven;
+      newLine += riskPercent + ",";
+      newLine += orderType + ",";
+      newLine += entryPrice + ",";
+      newLine += orderCount + ",";
+      newLine += sl + ",";
+      newLine += tp1 + ",";
+      newLine += tp2 + ",";
+      newLine += tp3 + ",";
+      newLine += tp4 + ",";
+      newLine += breakeven;
       
       ArrayResize(lines, lineCount + 1);
       lines[lineCount] = newLine;
@@ -2079,6 +2014,8 @@ void CTradeUtilityDialog::SaveInputsToDisk()
          FileWriteString(fileHandle, lines[i] + "\n");
       }
       FileClose(fileHandle);
+      m_dataLoadedFromDisk = true;
+      UpdateDataStatusLabel();
    }
 }
 
@@ -2087,24 +2024,33 @@ void CTradeUtilityDialog::SaveInputsToDisk()
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::LoadInputsFromDisk()
 {
-   // Reset to defaults first (important for new symbols with no saved data)
-   m_savedRiskPercent = "1.0";
-   m_savedOrderType = "MARKET";
-   m_savedEntryPrice = "0.00000";
-   m_savedOrderCount = "2";
-   m_savedSL = "0.00";
-   m_savedTP1 = "0.00";
-   m_savedTP2 = "0.00";
-   m_savedTP3 = "0.00";
-   m_savedTP4 = "0.00";
-   m_savedBreakeven = "After TP1";
+   // Default values
+   string riskPercent = "1.0";
+   string orderType = "MARKET";
+   string entryPrice = "0.00000";
+   string orderCount = "2";
+   string sl = "0.00";
+   string tp1 = "0.00";
+   string tp2 = "0.00";
+   string tp3 = "0.00";
+   string tp4 = "0.00";
+   string breakeven = "After TP1";
+   
+   m_dataLoadedFromDisk = false;
    
    if(!FileIsExist(m_inputsFile))
+   {
+      // Apply defaults to UI
+      ApplyInputsToUI(riskPercent, orderType, entryPrice, orderCount, sl, tp1, tp2, tp3, tp4, breakeven);
       return;
+   }
    
    int fileHandle = FileOpen(m_inputsFile, FILE_READ|FILE_TXT|FILE_ANSI);
    if(fileHandle == INVALID_HANDLE)
+   {
+      ApplyInputsToUI(riskPercent, orderType, entryPrice, orderCount, sl, tp1, tp2, tp3, tp4, breakeven);
       return;
+   }
    
    // Skip header
    if(!FileIsEnding(fileHandle))
@@ -2122,22 +2068,87 @@ void CTradeUtilityDialog::LoadInputsFromDisk()
       
       if(fieldCount >= 11 && fields[0] == m_currentSymbol)
       {
-         // Found saved inputs for this symbol - override defaults
-         m_savedRiskPercent = fields[1];
-         m_savedOrderType = fields[2];
-         m_savedEntryPrice = fields[3];
-         m_savedOrderCount = fields[4];
-         m_savedSL = fields[5];
-         m_savedTP1 = fields[6];
-         m_savedTP2 = fields[7];
-         m_savedTP3 = fields[8];
-         m_savedTP4 = fields[9];
-         m_savedBreakeven = fields[10];
+         // Found saved inputs for this symbol
+         riskPercent = fields[1];
+         orderType = fields[2];
+         entryPrice = fields[3];
+         orderCount = fields[4];
+         sl = fields[5];
+         tp1 = fields[6];
+         tp2 = fields[7];
+         tp3 = fields[8];
+         tp4 = fields[9];
+         breakeven = fields[10];
+         m_dataLoadedFromDisk = true;
          break;
       }
    }
    
    FileClose(fileHandle);
+   
+   // Apply loaded (or default) values to UI
+   ApplyInputsToUI(riskPercent, orderType, entryPrice, orderCount, sl, tp1, tp2, tp3, tp4, breakeven);
+}
+
+//+------------------------------------------------------------------+
+//| Apply input values to UI controls                                |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::ApplyInputsToUI(string riskPercent, string orderType, string entryPrice, 
+                                          string orderCount, string sl, string tp1, string tp2, 
+                                          string tp3, string tp4, string breakeven)
+{
+   // Validate data before applying
+   if(!ValidateInputData(riskPercent, entryPrice, sl, tp1, tp2, tp3, tp4))
+   {
+      // Reset to safe defaults if validation fails
+      riskPercent = "1.0";
+      entryPrice = "0.00000";
+      sl = "0.00";
+      tp1 = "0.00";
+      tp2 = "0.00";
+      tp3 = "0.00";
+      tp4 = "0.00";
+      m_dataLoadedFromDisk = false;
+   }
+   
+   // Apply to edit fields
+   m_edtRiskPercent.Text(riskPercent);
+   m_edtSL.Text(sl);
+   m_edtTP1.Text(tp1);
+   m_edtTP2.Text(tp2);
+   m_edtTP3.Text(tp3);
+   m_edtTP4.Text(tp4);
+   
+   // Apply order type
+   if(orderType == "MARKET")
+      m_cmbOrderType.Select(0);
+   else
+      m_cmbOrderType.Select(1);
+   m_isMarketOrder = (orderType == "MARKET");
+   
+   // For pending orders, set entry price; for market orders it will update on tick
+   if(!m_isMarketOrder)
+      m_edtEntryPrice.Text(entryPrice);
+   
+   // Apply order count
+   int orderCountInt = (int)StringToInteger(orderCount);
+   if(orderCountInt >= 1 && orderCountInt <= 4)
+   {
+      m_cmbOrderCount.Select(orderCountInt - 1);
+      m_orderCount = orderCountInt;
+   }
+   
+   // Apply breakeven setting
+   if(breakeven == "Disabled")
+      m_cmbBreakeven.Select(0);
+   else if(breakeven == "After TP1")
+      m_cmbBreakeven.Select(1);
+   else if(breakeven == "After TP2")
+      m_cmbBreakeven.Select(2);
+   
+   // Update UI state based on loaded settings
+   OnChangeOrderType();
+   UpdateTPFields();
 }
 
 //+------------------------------------------------------------------+
@@ -2159,6 +2170,7 @@ void CTradeUtilityDialog::OnTick()
       
       // Update to new symbol
       m_currentSymbol = _Symbol;
+      m_lastBidPrice = 0;  // Reset price tracking for new symbol
       
       // Update symbol info
       UpdateSymbolInfo();
@@ -2177,12 +2189,18 @@ void CTradeUtilityDialog::OnTick()
    if(m_isMarketOrder)
    {
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-      m_edtEntryPrice.Text(DoubleToString(bid, digits));
+      
+      // Only update UI if price actually changed (avoid redundant calculations)
+      if(MathAbs(bid - m_lastBidPrice) > 0.000001)
+      {
+         m_lastBidPrice = bid;
+         int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+         m_edtEntryPrice.Text(DoubleToString(bid, digits));
 
-      // Recalculate lot size and update dollar values for MARKET orders
-      CalculateLotSize();
-      UpdateDollarValues();
+         // Recalculate lot size and update dollar values for MARKET orders
+         CalculateLotSize();
+         UpdateDollarValues();
+      }
    }
 
    // Process breakeven logic
@@ -2268,7 +2286,6 @@ bool CTradeUtilityDialog::OnEvent(const int id, const long &lparam, const double
          sparam == m_edtTP4.Name())
       {
          UpdateDollarValues();
-         SaveInputValues();  // Save to disk
          return true;
       }
    }
