@@ -26,53 +26,186 @@ input double max_range_size = 1500;                    // Maximum range size in 
 input double min_range_size = 500;                     // Minimum range size in points (0=off)
 input int max_spread_points = 50;                      // Maximum spread in points (0=off)
 input double max_weekly_loss_pct = 2.5;                // Maximum weekly loss % of balance (0=off)
+input bool include_floating_in_weekly_limit = true;    // Include unrealized losses in weekly limit check
 
 // Trend Confirmation Parameters
 input bool enable_trend_confirmation = true; // Enable multi-timeframe trend confirmation
 input int trend_swing_period = 10;           // Period for swing highs/lows detection
 input int trend_momentum_period = 5;         // Period for recent momentum check
 input bool require_all_timeframes = true;    // Require all timeframes to agree
+input int trend_cache_seconds = 60;          // Seconds to cache trend confirmation results
 
-// Global Variables
-double g_high_price = 0;
-double g_low_price = 0;
-datetime g_range_end_time = 0;
-datetime g_close_time = 0;
-bool g_range_calculated = false;
-bool g_orders_placed = false;
-ulong g_buy_ticket = 0;
-ulong g_sell_ticket = 0;
-double g_lot_size = 0;
-datetime g_range_start_time = 0;
+// ============================================================================
+// STRUCT DEFINITIONS
+// ============================================================================
+
+// Range state tracking
+struct RangeState
+{
+   double   high_price;
+   double   low_price;
+   datetime start_time;
+   datetime end_time;
+   datetime close_time;
+   bool     calculated;
+   bool     lines_drawn;
+
+   void Reset()
+   {
+      high_price = 0;
+      low_price = 0;
+      start_time = 0;
+      end_time = 0;
+      close_time = 0;
+      calculated = false;
+      lines_drawn = false;
+   }
+};
+
+// Order state tracking
+struct OrderState
+{
+   ulong  buy_ticket;
+   ulong  sell_ticket;
+   double lot_size;
+   bool   orders_placed;
+
+   void Reset()
+   {
+      buy_ticket = 0;
+      sell_ticket = 0;
+      lot_size = 0;
+      orders_placed = false;
+   }
+};
+
+// Weekly loss tracking
+struct WeeklyState
+{
+   datetime week_start;
+   double   start_balance;
+   double   closed_loss;
+   bool     limit_reached;
+
+   void Reset()
+   {
+      week_start = 0;
+      start_balance = 0;
+      closed_loss = 0;
+      limit_reached = false;
+   }
+};
+
+// Trend confirmation caching
+struct TrendCache
+{
+   datetime cache_time;
+   bool     bullish_confirmed;
+   bool     bearish_confirmed;
+
+   void Reset()
+   {
+      cache_time = 0;
+      bullish_confirmed = false;
+      bearish_confirmed = false;
+   }
+};
+
+// Range statistics tracking
+struct RangeStats
+{
+   double   max_range_ever;
+   double   min_range_ever;
+   datetime max_range_date;
+   datetime min_range_date;
+
+   void Init()
+   {
+      max_range_ever = 0;
+      min_range_ever = 999999;
+      max_range_date = 0;
+      min_range_date = 0;
+   }
+};
+
+// Price cache
+struct PriceCache
+{
+   double bid;
+   double ask;
+
+   void Update()
+   {
+      bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   }
+
+   double Mid() { return (bid + ask) / 2; }
+};
+
+// ============================================================================
+// GLOBAL STATE INSTANCES
+// ============================================================================
+
+RangeState  g_range;
+OrderState  g_order;
+WeeklyState g_weekly;
+TrendCache  g_trend;
+RangeStats  g_stats;
+PriceCache  g_price;
+
+// Other globals
 datetime g_current_day = 0;
-string g_start_line_name = "Range_Start_Line";
-string g_end_line_name = "Range_End_Line";
-string g_close_line_name = "Range_Close_Line";
-bool g_lines_drawn = false;
-int g_trailing_points = 300;       // Trailing stop in points (default 30 pips)
-bool g_trailing_activated = false; // Default trailing status
+int g_trailing_points = 300;
+bool g_trailing_activated = false;
+bool g_one_breakout_mode = false;
 
-// Add these global variables to track ranges
-double g_max_range_ever = 0;      // Track maximum range seen
-double g_min_range_ever = 999999; // Track minimum range seen
-datetime g_max_range_date = 0;    // Date of maximum range
-datetime g_min_range_date = 0;    // Date of minimum range
-
-// Weekly loss tracking variables
-datetime g_week_start = 0;        // Start of current trading week
-double g_weekly_closed_loss = 0;  // Accumulated closed losses this week
-double g_week_start_balance = 0;  // Balance at start of week
-bool g_weekly_limit_reached = false; // Flag when weekly limit is hit
+// Line names (constants)
+const string LINE_START = "Range_Start_Line";
+const string LINE_END   = "Range_End_Line";
+const string LINE_CLOSE = "Range_Close_Line";
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Initialize
-   g_range_calculated = false;
-   g_orders_placed = false;
-   g_lines_drawn = false;
+   // Input parameter validation
+   if (risk_percentage <= 0 || risk_percentage > 10)
+   {
+      Print("WARNING: risk_percentage (", risk_percentage, "%) is outside recommended range (0.1-10%). Proceeding with caution.");
+   }
+
+   if (range_duration <= 0)
+   {
+      Print("ERROR: range_duration must be greater than 0");
+      return (INIT_PARAMETERS_INCORRECT);
+   }
+
+   if (trend_swing_period <= trend_momentum_period + 1)
+   {
+      Print("ERROR: trend_swing_period (", trend_swing_period, ") must be greater than trend_momentum_period + 1 (", trend_momentum_period + 1, ")");
+      return (INIT_PARAMETERS_INCORRECT);
+   }
+
+   if (max_weekly_loss_pct < 0 || max_weekly_loss_pct > 50)
+   {
+      Print("WARNING: max_weekly_loss_pct (", max_weekly_loss_pct, "%) is outside recommended range (0-50%).");
+   }
+
+   if (trailing_stop > 0 && trailing_start > 0 && trailing_start <= trailing_stop)
+   {
+      Print("WARNING: trailing_start (", trailing_start, ") should be greater than trailing_stop (", trailing_stop, ") for effective trailing.");
+   }
+
+   // Cache breakout mode check (avoid string comparison every tick)
+   g_one_breakout_mode = (StringCompare(breakout_mode, "one breakout per range") == 0);
+
+   // Initialize structs
+   g_range.Reset();
+   g_order.Reset();
+   g_trend.Reset();
+   g_stats.Init();
    g_trailing_points = trailing_stop;
 
    // Set current day
@@ -108,11 +241,11 @@ void OnDeinit(const int reason)
    Print("           DAILY BREAKOUT EA REPORT           ");
    Print("===============================================");
 
-   if (g_max_range_ever > 0)
+   if (g_stats.max_range_ever > 0)
    {
       Print("=== Range Statistics ===");
-      Print("Maximum range during backtest: ", g_max_range_ever, " points on ", TimeToString(g_max_range_date));
-      Print("Minimum range during backtest: ", g_min_range_ever, " points on ", TimeToString(g_min_range_date));
+      Print("Maximum range during backtest: ", g_stats.max_range_ever, " points on ", TimeToString(g_stats.max_range_date));
+      Print("Minimum range during backtest: ", g_stats.min_range_ever, " points on ", TimeToString(g_stats.min_range_date));
       Print("======================");
    }
 
@@ -143,7 +276,7 @@ void OnDeinit(const int reason)
    if (max_weekly_loss_pct > 0)
    {
       Print("Max weekly loss: ", max_weekly_loss_pct, "% of balance");
-      Print("Weekly closed loss this week: $", NormalizeDouble(g_weekly_closed_loss, 2));
+      Print("Weekly closed loss this week: $", NormalizeDouble(g_weekly.closed_loss, 2));
    }
    else
       Print("Max weekly loss: DISABLED");
@@ -159,6 +292,9 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Cache prices at start of tick (avoid multiple SymbolInfoDouble calls)
+   g_price.Update();
+
    // Check if day has changed
    MqlDateTime dt;
    TimeCurrent(dt);
@@ -170,18 +306,18 @@ void OnTick()
    if (today != g_current_day)
    {
       // New day, reset EA
-      g_range_calculated = false;
-      g_orders_placed = false;
-      g_lines_drawn = false;
+      g_range.Reset();
+      g_order.Reset();
+      g_trend.Reset();
       g_current_day = today;
       DeleteAllLines();
-      
+
       // Check for new week (Monday)
       CheckWeeklyReset();
    }
 
    // Check if weekly loss limit reached (only affects new order placement)
-   if (g_weekly_limit_reached && !g_orders_placed)
+   if (g_weekly.limit_reached && !g_order.orders_placed)
    {
       // Weekly limit reached - don't place new orders
       return;
@@ -192,21 +328,21 @@ void OnTick()
       return;
 
    // Calculate daily range if not already done
-   if (!g_range_calculated)
+   if (!g_range.calculated)
    {
       CalculateDailyRange();
       return;
    }
 
    // Draw vertical lines for range times if not already drawn
-   if (!g_lines_drawn)
+   if (!g_range.lines_drawn)
    {
       DrawRangeLines();
-      g_lines_drawn = true;
+      g_range.lines_drawn = true;
    }
 
    // Check if we should place orders
-   if (!g_orders_placed && TimeCurrent() >= g_range_end_time)
+   if (!g_order.orders_placed && TimeCurrent() >= g_range.end_time)
    {
       PlacePendingOrders();
       return;
@@ -219,7 +355,7 @@ void OnTick()
    }
 
    // Check if we should close all orders
-   if (g_orders_placed && range_close_time > 0 && TimeCurrent() >= g_close_time)
+   if (g_order.orders_placed && range_close_time > 0 && TimeCurrent() >= g_range.close_time)
    {
       CloseAllOrders();
       return;
@@ -242,19 +378,19 @@ void InitializeWeeklyTracking()
       return;
 
    // Calculate start of current week (Monday 00:00)
-   g_week_start = GetWeekStartTime(TimeCurrent());
-   g_week_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   g_weekly_closed_loss = 0;
-   g_weekly_limit_reached = false;
+   g_weekly.week_start = GetWeekStartTime(TimeCurrent());
+   g_weekly.start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_weekly.closed_loss = 0;
+   g_weekly.limit_reached = false;
 
    // Calculate closed losses from history for this week
    CalculateWeeklyClosedLoss();
 
    Print("=== Weekly Loss Tracking Initialized ===");
-   Print("Week start: ", TimeToString(g_week_start));
-   Print("Week start balance: $", NormalizeDouble(g_week_start_balance, 2));
-   Print("Weekly closed loss so far: $", NormalizeDouble(g_weekly_closed_loss, 2));
-   Print("Weekly loss limit: ", max_weekly_loss_pct, "% ($", NormalizeDouble(g_week_start_balance * max_weekly_loss_pct / 100, 2), ")");
+   Print("Week start: ", TimeToString(g_weekly.week_start));
+   Print("Week start balance: $", NormalizeDouble(g_weekly.start_balance, 2));
+   Print("Weekly closed loss so far: $", NormalizeDouble(g_weekly.closed_loss, 2));
+   Print("Weekly loss limit: ", max_weekly_loss_pct, "% ($", NormalizeDouble(g_weekly.start_balance * max_weekly_loss_pct / 100, 2), ")");
    Print("========================================");
 }
 
@@ -290,19 +426,19 @@ void CheckWeeklyReset()
 
    datetime current_week_start = GetWeekStartTime(TimeCurrent());
    
-   if (current_week_start > g_week_start)
+   if (current_week_start > g_weekly.week_start)
    {
       // New week has started
       Print("=== New Trading Week Started ===");
-      Print("Previous week closed loss: $", NormalizeDouble(g_weekly_closed_loss, 2));
+      Print("Previous week closed loss: $", NormalizeDouble(g_weekly.closed_loss, 2));
       
-      g_week_start = current_week_start;
-      g_week_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      g_weekly_closed_loss = 0;
-      g_weekly_limit_reached = false;
+      g_weekly.week_start = current_week_start;
+      g_weekly.start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_weekly.closed_loss = 0;
+      g_weekly.limit_reached = false;
       
-      Print("New week start balance: $", NormalizeDouble(g_week_start_balance, 2));
-      Print("Weekly loss limit reset: ", max_weekly_loss_pct, "% ($", NormalizeDouble(g_week_start_balance * max_weekly_loss_pct / 100, 2), ")");
+      Print("New week start balance: $", NormalizeDouble(g_weekly.start_balance, 2));
+      Print("Weekly loss limit reset: ", max_weekly_loss_pct, "% ($", NormalizeDouble(g_weekly.start_balance * max_weekly_loss_pct / 100, 2), ")");
       Print("================================");
    }
 }
@@ -315,10 +451,10 @@ void CalculateWeeklyClosedLoss()
    if (max_weekly_loss_pct <= 0)
       return;
 
-   g_weekly_closed_loss = 0;
+   g_weekly.closed_loss = 0;
    
    // Select history from week start to now
-   if (!HistorySelect(g_week_start, TimeCurrent()))
+   if (!HistorySelect(g_weekly.week_start, TimeCurrent()))
    {
       Print("Warning: Could not select trade history for weekly loss calculation");
       return;
@@ -348,7 +484,7 @@ void CalculateWeeklyClosedLoss()
                // Only track losses (negative PnL)
                if (total_pnl < 0)
                {
-                  g_weekly_closed_loss += MathAbs(total_pnl);
+                  g_weekly.closed_loss += MathAbs(total_pnl);
                }
             }
          }
@@ -366,27 +502,71 @@ void CheckWeeklyLossLimit()
 {
    if (max_weekly_loss_pct <= 0)
    {
-      g_weekly_limit_reached = false;
+      g_weekly.limit_reached = false;
       return;
    }
-   
-   double max_weekly_loss_amount = g_week_start_balance * max_weekly_loss_pct / 100;
-   
-   if (g_weekly_closed_loss >= max_weekly_loss_amount)
+
+   double max_weekly_loss_amount = g_weekly.start_balance * max_weekly_loss_pct / 100;
+
+   // Calculate total weekly loss (closed + optional floating)
+   double total_weekly_loss = g_weekly.closed_loss;
+
+   if (include_floating_in_weekly_limit)
    {
-      if (!g_weekly_limit_reached)
+      double floating_loss = GetOpenPositionsFloatingLoss();
+      total_weekly_loss += floating_loss;
+   }
+
+   if (total_weekly_loss >= max_weekly_loss_amount)
+   {
+      if (!g_weekly.limit_reached)
       {
-         g_weekly_limit_reached = true;
+         g_weekly.limit_reached = true;
          Print("!!! WEEKLY LOSS LIMIT REACHED !!!");
-         Print("Weekly closed loss: $", NormalizeDouble(g_weekly_closed_loss, 2));
-         Print("Weekly limit: $", NormalizeDouble(max_weekly_loss_amount, 2), " (", max_weekly_loss_pct, "% of $", NormalizeDouble(g_week_start_balance, 2), ")");
+         Print("Weekly closed loss: $", NormalizeDouble(g_weekly.closed_loss, 2));
+         if (include_floating_in_weekly_limit)
+            Print("Weekly floating loss: $", NormalizeDouble(total_weekly_loss - g_weekly.closed_loss, 2));
+         Print("Total weekly loss: $", NormalizeDouble(total_weekly_loss, 2));
+         Print("Weekly limit: $", NormalizeDouble(max_weekly_loss_amount, 2), " (", max_weekly_loss_pct, "% of $", NormalizeDouble(g_weekly.start_balance, 2), ")");
          Print("No new trades will be opened until next week.");
       }
    }
    else
    {
-      g_weekly_limit_reached = false;
+      g_weekly.limit_reached = false;
    }
+}
+
+//+------------------------------------------------------------------+
+//| Get total floating loss from open positions                       |
+//+------------------------------------------------------------------+
+double GetOpenPositionsFloatingLoss()
+{
+   double floating_loss = 0;
+
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if (position_ticket > 0)
+      {
+         // Check if this position belongs to our EA
+         if (PositionGetInteger(POSITION_MAGIC) == magic_number &&
+             PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            double position_profit = PositionGetDouble(POSITION_PROFIT);
+            double position_swap = PositionGetDouble(POSITION_SWAP);
+            double total_pnl = position_profit + position_swap;
+
+            // Only count losses (negative PnL)
+            if (total_pnl < 0)
+            {
+               floating_loss += MathAbs(total_pnl);
+            }
+         }
+      }
+   }
+
+   return floating_loss;
 }
 
 //+------------------------------------------------------------------+
@@ -400,8 +580,8 @@ void UpdateWeeklyLossOnClose(double closed_pnl)
    // Only track losses
    if (closed_pnl < 0)
    {
-      g_weekly_closed_loss += MathAbs(closed_pnl);
-      Print("Weekly closed loss updated: $", NormalizeDouble(g_weekly_closed_loss, 2));
+      g_weekly.closed_loss += MathAbs(closed_pnl);
+      Print("Weekly closed loss updated: $", NormalizeDouble(g_weekly.closed_loss, 2));
       
       // Check if limit is now reached
       CheckWeeklyLossLimit();
@@ -416,6 +596,10 @@ int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
    // Return: 1 = Uptrend (higher highs and higher lows)
    // Return: -1 = Downtrend (lower highs and lower lows)
    // Return: 0 = Sideways/No clear trend
+
+   // Defensive parameter validation
+   if (trend_swing_period <= trend_momentum_period + 1 || trend_momentum_period < 1)
+      return 0;  // Invalid parameters
 
    int bars_needed = trend_swing_period * 3; // Need enough bars for analysis
    if (Bars(_Symbol, timeframe) < bars_needed)
@@ -469,7 +653,7 @@ int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
    }
 
    // Check recent momentum (last few bars)
-   double current_price = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2;
+   double current_price = (g_price.bid + g_price.ask) / 2;
    double old_price = 0;
 
    double closes[];  // Use separate array for close prices
@@ -575,6 +759,15 @@ void GetTrendConfirmation(bool &bullish_confirmed, bool &bearish_confirmed)
       return;
    }
 
+   // Check if cached results are still valid
+   if (g_trend.cache_time > 0 && (TimeCurrent() - g_trend.cache_time) < trend_cache_seconds)
+   {
+      bullish_confirmed = g_trend.bullish_confirmed;
+      bearish_confirmed = g_trend.bearish_confirmed;
+      Print("Using cached trend confirmation (age: ", (TimeCurrent() - g_trend.cache_time), "s)");
+      return;
+   }
+
    ENUM_TIMEFRAMES timeframes[] = {PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4};
    string timeframe_names[] = {"M5", "M15", "H1", "H4"};
 
@@ -623,11 +816,28 @@ void GetTrendConfirmation(bool &bullish_confirmed, bool &bearish_confirmed)
    bullish_confirmed = (bullish_agreeing >= required_timeframes);
    bearish_confirmed = (bearish_agreeing >= required_timeframes);
 
+   // Cache the results
+   g_trend.cache_time = TimeCurrent();
+   g_trend.bullish_confirmed = bullish_confirmed;
+   g_trend.bearish_confirmed = bearish_confirmed;
+
    Print("Bullish confirmation: ", bullish_agreeing, "/", total_timeframes,
          " (Required: ", required_timeframes, ") - ", (bullish_confirmed ? "PASSED" : "FAILED"));
    Print("Bearish confirmation: ", bearish_agreeing, "/", total_timeframes,
          " (Required: ", required_timeframes, ") - ", (bearish_confirmed ? "PASSED" : "FAILED"));
+   Print("Trend confirmation cached for ", trend_cache_seconds, " seconds");
    Print("================================");
+}
+
+//+------------------------------------------------------------------+
+//| Log recovery of position or order                                 |
+//+------------------------------------------------------------------+
+void LogRecovery(string type, ulong ticket, double price = 0)
+{
+   if (price > 0)
+      Print("Recovered ", type, " #", ticket, " at ", price);
+   else
+      Print("Recovered ", type, " #", ticket);
 }
 
 //+------------------------------------------------------------------+
@@ -644,28 +854,26 @@ void RecoverExistingPositions()
    for (int i = 0; i < PositionsTotal(); i++)
    {
       ulong position_ticket = PositionGetTicket(i);
-      if (position_ticket > 0)
+      if (position_ticket > 0 &&
+          PositionGetInteger(POSITION_MAGIC) == magic_number &&
+          PositionGetString(POSITION_SYMBOL) == _Symbol)
       {
-         if (PositionGetInteger(POSITION_MAGIC) == magic_number && 
-             PositionGetString(POSITION_SYMBOL) == _Symbol)
+         ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+         if (pos_type == POSITION_TYPE_BUY)
          {
-            ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-            
-            if (pos_type == POSITION_TYPE_BUY)
-            {
-               g_buy_ticket = position_ticket;
-               Print("Recovered BUY position #", position_ticket);
-            }
-            else if (pos_type == POSITION_TYPE_SELL)
-            {
-               g_sell_ticket = position_ticket;
-               Print("Recovered SELL position #", position_ticket);
-            }
-            
-            recovered_positions++;
-            g_orders_placed = true;  // Mark as already placed for today
-            g_range_calculated = true;  // Assume range was calculated
+            g_order.buy_ticket = position_ticket;
+            LogRecovery("BUY position", position_ticket);
          }
+         else if (pos_type == POSITION_TYPE_SELL)
+         {
+            g_order.sell_ticket = position_ticket;
+            LogRecovery("SELL position", position_ticket);
+         }
+
+         recovered_positions++;
+         g_order.orders_placed = true;
+         g_range.calculated = true;
       }
    }
 
@@ -673,37 +881,35 @@ void RecoverExistingPositions()
    for (int i = 0; i < OrdersTotal(); i++)
    {
       ulong order_ticket = OrderGetTicket(i);
-      if (order_ticket > 0)
+      if (order_ticket > 0 &&
+          OrderGetInteger(ORDER_MAGIC) == magic_number &&
+          OrderGetString(ORDER_SYMBOL) == _Symbol)
       {
-         if (OrderGetInteger(ORDER_MAGIC) == magic_number && 
-             OrderGetString(ORDER_SYMBOL) == _Symbol)
+         ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+
+         if (order_type == ORDER_TYPE_BUY_STOP)
          {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            
-            if (order_type == ORDER_TYPE_BUY_STOP)
-            {
-               g_buy_ticket = order_ticket;
-               g_high_price = OrderGetDouble(ORDER_PRICE_OPEN);
-               Print("Recovered BUY STOP order #", order_ticket, " at ", g_high_price);
-            }
-            else if (order_type == ORDER_TYPE_SELL_STOP)
-            {
-               g_sell_ticket = order_ticket;
-               g_low_price = OrderGetDouble(ORDER_PRICE_OPEN);
-               Print("Recovered SELL STOP order #", order_ticket, " at ", g_low_price);
-            }
-            
-            recovered_orders++;
-            g_orders_placed = true;  // Mark as already placed for today
-            g_range_calculated = true;  // Assume range was calculated
+            g_order.buy_ticket = order_ticket;
+            g_range.high_price = OrderGetDouble(ORDER_PRICE_OPEN);
+            LogRecovery("BUY STOP order", order_ticket, g_range.high_price);
          }
+         else if (order_type == ORDER_TYPE_SELL_STOP)
+         {
+            g_order.sell_ticket = order_ticket;
+            g_range.low_price = OrderGetDouble(ORDER_PRICE_OPEN);
+            LogRecovery("SELL STOP order", order_ticket, g_range.low_price);
+         }
+
+         recovered_orders++;
+         g_order.orders_placed = true;
+         g_range.calculated = true;
       }
    }
 
    if (recovered_positions > 0 || recovered_orders > 0)
    {
       Print("Recovery complete: ", recovered_positions, " positions, ", recovered_orders, " pending orders");
-      
+
       // Recalculate close time for today
       if (range_close_time > 0)
       {
@@ -713,8 +919,8 @@ void RecoverExistingPositions()
          dt.min = 0;
          dt.sec = 0;
          datetime today = StructToTime(dt);
-         g_close_time = today + range_close_time * 60;
-         Print("Close time set to: ", TimeToString(g_close_time));
+         g_range.close_time = today + range_close_time * 60;
+         Print("Close time set to: ", TimeToString(g_range.close_time));
       }
    }
    else
@@ -767,24 +973,24 @@ void CalculateDailyRange()
    datetime today = StructToTime(dt);
 
    // Calculate range start time
-   g_range_start_time = today + range_start_time * 60;
+   g_range.start_time = today + range_start_time * 60;
 
    // Calculate range end time
-   g_range_end_time = g_range_start_time + range_duration * 60;
+   g_range.end_time = g_range.start_time + range_duration * 60;
 
    // Calculate order close time
    if (range_close_time > 0)
-      g_close_time = today + range_close_time * 60;
+      g_range.close_time = today + range_close_time * 60;
    else
-      g_close_time = 0; // No automatic close time
+      g_range.close_time = 0; // No automatic close time
 
    // Check if we're still in range calculation period
-   if (current_time < g_range_end_time)
+   if (current_time < g_range.end_time)
       return;
 
    // Calculate the high and low of the range
-   g_high_price = 0;
-   g_low_price = 99999999;
+   g_range.high_price = 0;
+   g_range.low_price = 99999999;
 
    int bars_to_check = range_duration / PeriodSeconds(PERIOD_M1) * 60;
    if (bars_to_check > Bars(_Symbol, PERIOD_M1))
@@ -794,42 +1000,46 @@ void CalculateDailyRange()
    {
       datetime bar_time = iTime(_Symbol, PERIOD_M1, i);
 
+      // Early exit: bars are ordered newest to oldest, so if we've passed the range start, no more matches
+      if (bar_time < g_range.start_time)
+         break;
+
       // Check if the bar is within our range time
-      if (bar_time >= g_range_start_time && bar_time <= g_range_end_time)
+      if (bar_time >= g_range.start_time && bar_time <= g_range.end_time)
       {
          double bar_high = iHigh(_Symbol, PERIOD_M1, i);
-         if (bar_high > g_high_price)
-            g_high_price = bar_high;
+         if (bar_high > g_range.high_price)
+            g_range.high_price = bar_high;
 
          double bar_low = iLow(_Symbol, PERIOD_M1, i);
-         if (bar_low < g_low_price)
-            g_low_price = bar_low;
+         if (bar_low < g_range.low_price)
+            g_range.low_price = bar_low;
       }
    }
 
    // Mark range as calculated
-   if (g_high_price > 0 && g_low_price < 99999999)
+   if (g_range.high_price > 0 && g_range.low_price < 99999999)
    {
-      g_range_calculated = true;
-      double range_size = g_high_price - g_low_price;
+      g_range.calculated = true;
+      double range_size = g_range.high_price - g_range.low_price;
       double range_points = range_size / _Point;
 
       // Track maximum and minimum ranges observed
-      if (range_points > g_max_range_ever)
+      if (range_points > g_stats.max_range_ever)
       {
-         g_max_range_ever = range_points;
-         g_max_range_date = TimeCurrent();
-         Print("New maximum range detected: ", range_points, " points on ", TimeToString(g_max_range_date));
+         g_stats.max_range_ever = range_points;
+         g_stats.max_range_date = TimeCurrent();
+         Print("New maximum range detected: ", range_points, " points on ", TimeToString(g_stats.max_range_date));
       }
 
-      if (range_points < g_min_range_ever)
+      if (range_points < g_stats.min_range_ever)
       {
-         g_min_range_ever = range_points;
-         g_min_range_date = TimeCurrent();
-         Print("New minimum range detected: ", range_points, " points on ", TimeToString(g_min_range_date));
+         g_stats.min_range_ever = range_points;
+         g_stats.min_range_date = TimeCurrent();
+         Print("New minimum range detected: ", range_points, " points on ", TimeToString(g_stats.min_range_date));
       }
 
-      Print("Daily range calculated - High: ", g_high_price, " Low: ", g_low_price,
+      Print("Daily range calculated - High: ", g_range.high_price, " Low: ", g_range.low_price,
             " Range: ", range_points, " points");
    }
 }
@@ -881,6 +1091,9 @@ double CalculateLotSize(double range_size)
       if (lot_step > 0)
       {
          lot_size = MathFloor(lot_size / lot_step) * lot_step;
+         // Normalize based on lot_step precision (handles 0.01, 0.001, etc.)
+         int lot_digits = (int)MathMax(0, MathCeil(-MathLog10(lot_step)));
+         lot_size = NormalizeDouble(lot_size, lot_digits);
       }
 
       // Apply minimum/maximum lot constraints
@@ -895,9 +1108,6 @@ double CalculateLotSize(double range_size)
       lot_size = min_lot;
       Print("Warning: Could not calculate risk-based lot size, using minimum lot");
    }
-
-   // Normalize to 2 decimal places
-   lot_size = NormalizeDouble(lot_size, 2);
 
    Print("Risk-based lot calculation:");
    Print("  Account Balance: $", account_balance);
@@ -917,24 +1127,24 @@ double CalculateLotSize(double range_size)
 //+------------------------------------------------------------------+
 void PlacePendingOrders()
 {
-   if (g_high_price <= 0 || g_low_price >= 99999999)
+   if (g_range.high_price <= 0 || g_range.low_price >= 99999999)
       return;
 
    // Check weekly loss limit before placing orders
-   if (max_weekly_loss_pct > 0 && g_weekly_limit_reached)
+   if (max_weekly_loss_pct > 0 && g_weekly.limit_reached)
    {
       Print("Weekly loss limit reached - no new orders will be placed until next week");
-      g_orders_placed = true; // Mark as processed so we don't try again today
+      g_order.orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
 
-   double range_size = g_high_price - g_low_price;
+   double range_size = g_range.high_price - g_range.low_price;
    double range_points = range_size / _Point;
 
    Print("=== Daily Range Details ===");
    Print("Date: ", TimeToString(TimeCurrent()));
-   Print("Range High: ", g_high_price);
-   Print("Range Low: ", g_low_price);
+   Print("Range High: ", g_range.high_price);
+   Print("Range Low: ", g_range.low_price);
    Print("Range Size: ", range_points, " points");
    Print("=========================");
 
@@ -942,14 +1152,14 @@ void PlacePendingOrders()
    if (max_range_size > 0 && range_points > max_range_size)
    {
       Print("Range size (", range_points, " points) exceeds maximum (", max_range_size, " points). No orders placed.");
-      g_orders_placed = true; // Mark as processed so we don't try again today
+      g_order.orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
 
    if (min_range_size > 0 && range_points < min_range_size)
    {
       Print("Range size (", range_points, " points) is below minimum (", min_range_size, " points). No orders placed.");
-      g_orders_placed = true; // Mark as processed so we don't try again today
+      g_order.orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
 
@@ -973,11 +1183,11 @@ void PlacePendingOrders()
    if (enable_trend_confirmation && !bullish_trend_confirmed && !bearish_trend_confirmed)
    {
       Print("No trend confirmation for either direction - skipping order placement for today");
-      g_orders_placed = true; // Mark as processed so we don't try again today
+      g_order.orders_placed = true; // Mark as processed so we don't try again today
       return;
    }
 
-   g_lot_size = CalculateLotSize(range_size);
+   g_order.lot_size = CalculateLotSize(range_size);
 
    // Calculate SL and TP
    double buy_sl = 0, buy_tp = 0, sell_sl = 0, sell_tp = 0;
@@ -985,14 +1195,14 @@ void PlacePendingOrders()
    if (stop_loss > 0)
    {
       // Calculate SL based on range percentage
-      buy_sl = g_high_price - (range_size * stop_loss / 100);
-      sell_sl = g_low_price + (range_size * stop_loss / 100);
+      buy_sl = g_range.high_price - (range_size * stop_loss / 100);
+      sell_sl = g_range.low_price + (range_size * stop_loss / 100);
    }
 
    if (take_profit > 0)
    {
-      buy_tp = g_high_price + (range_size * take_profit / 100);
-      sell_tp = g_low_price - (range_size * take_profit / 100);
+      buy_tp = g_range.high_price + (range_size * take_profit / 100);
+      sell_tp = g_range.low_price - (range_size * take_profit / 100);
    }
 
    // Place orders based on trend confirmation
@@ -1002,8 +1212,8 @@ void PlacePendingOrders()
    if (!enable_trend_confirmation || bullish_trend_confirmed)
    {
       bool buy_success = trade.BuyStop(
-          g_lot_size,
-          g_high_price,
+          g_order.lot_size,
+          g_range.high_price,
           _Symbol,
           buy_sl,
           buy_tp,
@@ -1013,8 +1223,8 @@ void PlacePendingOrders()
 
       if (buy_success)
       {
-         g_buy_ticket = trade.ResultOrder();
-         Print("✓ Buy Stop order placed at ", g_high_price, " with lot size ", g_lot_size, " (Bullish trend confirmed)");
+         g_order.buy_ticket = trade.ResultOrder();
+         Print("✓ Buy Stop order placed at ", g_range.high_price, " with lot size ", g_order.lot_size, " (Bullish trend confirmed)");
       }
       else
       {
@@ -1030,8 +1240,8 @@ void PlacePendingOrders()
    if (!enable_trend_confirmation || bearish_trend_confirmed)
    {
       bool sell_success = trade.SellStop(
-          g_lot_size,
-          g_low_price,
+          g_order.lot_size,
+          g_range.low_price,
           _Symbol,
           sell_sl,
           sell_tp,
@@ -1041,8 +1251,8 @@ void PlacePendingOrders()
 
       if (sell_success)
       {
-         g_sell_ticket = trade.ResultOrder();
-         Print("✓ Sell Stop order placed at ", g_low_price, " with lot size ", g_lot_size, " (Bearish trend confirmed)");
+         g_order.sell_ticket = trade.ResultOrder();
+         Print("✓ Sell Stop order placed at ", g_range.low_price, " with lot size ", g_order.lot_size, " (Bearish trend confirmed)");
       }
       else
       {
@@ -1054,7 +1264,7 @@ void PlacePendingOrders()
       Print("✗ Sell Stop order SKIPPED - bearish trend not confirmed");
    }
 
-   g_orders_placed = true;
+   g_order.orders_placed = true;
 }
 
 //+------------------------------------------------------------------+
@@ -1063,81 +1273,71 @@ void PlacePendingOrders()
 void ManageOrders()
 {
    // If using "one breakout per range" mode, check if one order has been triggered
-   if (StringCompare(breakout_mode, "one breakout per range") == 0)
+   if (g_one_breakout_mode)
    {
       bool buy_triggered = false;
       bool sell_triggered = false;
 
-      // Get order information
-      if (g_buy_ticket > 0)
+      // Check buy ticket status
+      if (g_order.buy_ticket > 0)
       {
-         // Check if the order still exists and if it's a market order (was triggered)
-         if (OrderSelect(g_buy_ticket))
+         // First check if it became a position (stop order was triggered)
+         if (PositionSelectByTicket(g_order.buy_ticket))
          {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if (order_type == ORDER_TYPE_BUY) // Changed from pending to market = triggered
+            if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
                buy_triggered = true;
+         }
+         // If not a position, check if pending order still exists
+         else if (OrderSelect(g_order.buy_ticket))
+         {
+            // Order still pending, not triggered yet
+            buy_triggered = false;
          }
          else
          {
-            // Check if it became a position (was triggered and is still open)
-            if (PositionSelectByTicket(g_buy_ticket))
-            {
-               if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                  buy_triggered = true;
-            }
-            else
-            {
-               g_buy_ticket = 0; // Order no longer exists
-            }
+            // Neither position nor order exists - was closed or cancelled
+            g_order.buy_ticket = 0;
          }
       }
 
-      // Check if sell stop order has been triggered
-      if (g_sell_ticket > 0)
+      // Check sell ticket status
+      if (g_order.sell_ticket > 0)
       {
-         // Check if the order still exists and if it's a market order (was triggered)
-         if (OrderSelect(g_sell_ticket))
+         // First check if it became a position (stop order was triggered)
+         if (PositionSelectByTicket(g_order.sell_ticket))
          {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if (order_type == ORDER_TYPE_SELL) // Changed from pending to market = triggered
+            if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
                sell_triggered = true;
+         }
+         // If not a position, check if pending order still exists
+         else if (OrderSelect(g_order.sell_ticket))
+         {
+            // Order still pending, not triggered yet
+            sell_triggered = false;
          }
          else
          {
-            // Check if it became a position (was triggered and is still open)
-            if (PositionSelectByTicket(g_sell_ticket))
-            {
-               if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-                  sell_triggered = true;
-            }
-            else
-            {
-               g_sell_ticket = 0; // Order no longer exists
-            }
+            // Neither position nor order exists - was closed or cancelled
+            g_order.sell_ticket = 0;
          }
       }
 
       // If one order has been triggered, delete the other pending order
-      if (buy_triggered && g_sell_ticket > 0)
+      if (buy_triggered && g_order.sell_ticket > 0)
       {
-         if (OrderSelect(g_sell_ticket))
+         if (OrderSelect(g_order.sell_ticket))
          {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if (order_type == ORDER_TYPE_SELL_STOP)
-               trade.OrderDelete(g_sell_ticket);
+            trade.OrderDelete(g_order.sell_ticket);
          }
-         g_sell_ticket = 0;
+         g_order.sell_ticket = 0;
       }
-      else if (sell_triggered && g_buy_ticket > 0)
+      else if (sell_triggered && g_order.buy_ticket > 0)
       {
-         if (OrderSelect(g_buy_ticket))
+         if (OrderSelect(g_order.buy_ticket))
          {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if (order_type == ORDER_TYPE_BUY_STOP)
-               trade.OrderDelete(g_buy_ticket);
+            trade.OrderDelete(g_order.buy_ticket);
          }
-         g_buy_ticket = 0;
+         g_order.buy_ticket = 0;
       }
    }
 }
@@ -1185,10 +1385,10 @@ void CloseAllOrders()
    }
 
    // Reset flags for next day
-   g_range_calculated = false;
-   g_orders_placed = false;
-   g_buy_ticket = 0;
-   g_sell_ticket = 0;
+   g_range.calculated = false;
+   g_order.orders_placed = false;
+   g_order.buy_ticket = 0;
+   g_order.sell_ticket = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -1215,8 +1415,8 @@ void ManageTrailingStop()
             double position_tp = PositionGetDouble(POSITION_TP);
             ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
-            // Current price depending on position type
-            double current_price = (position_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            // Current price depending on position type (use cached prices)
+            double current_price = (position_type == POSITION_TYPE_BUY) ? g_price.bid : g_price.ask;
 
             // Calculate current profit in points
             double profit_points = 0;
@@ -1315,27 +1515,27 @@ void DrawRangeLines()
    DeleteAllLines();
 
    // Draw range start line (blue)
-   ObjectCreate(0, g_start_line_name, OBJ_VLINE, 0, g_range_start_time, 0);
-   ObjectSetInteger(0, g_start_line_name, OBJPROP_COLOR, clrBlue);
-   ObjectSetInteger(0, g_start_line_name, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, g_start_line_name, OBJPROP_WIDTH, 2); // Thicker line
-   ObjectSetString(0, g_start_line_name, OBJPROP_TOOLTIP, "Range Start Time");
+   ObjectCreate(0, LINE_START, OBJ_VLINE, 0, g_range.start_time, 0);
+   ObjectSetInteger(0, LINE_START, OBJPROP_COLOR, clrBlue);
+   ObjectSetInteger(0, LINE_START, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, LINE_START, OBJPROP_WIDTH, 2); // Thicker line
+   ObjectSetString(0, LINE_START, OBJPROP_TOOLTIP, "Range Start Time");
 
    // Draw range end line (blue)
-   ObjectCreate(0, g_end_line_name, OBJ_VLINE, 0, g_range_end_time, 0);
-   ObjectSetInteger(0, g_end_line_name, OBJPROP_COLOR, clrBlue);
-   ObjectSetInteger(0, g_end_line_name, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, g_end_line_name, OBJPROP_WIDTH, 2); // Thicker line
-   ObjectSetString(0, g_end_line_name, OBJPROP_TOOLTIP, "Range End Time");
+   ObjectCreate(0, LINE_END, OBJ_VLINE, 0, g_range.end_time, 0);
+   ObjectSetInteger(0, LINE_END, OBJPROP_COLOR, clrBlue);
+   ObjectSetInteger(0, LINE_END, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, LINE_END, OBJPROP_WIDTH, 2); // Thicker line
+   ObjectSetString(0, LINE_END, OBJPROP_TOOLTIP, "Range End Time");
 
    // Draw range close line (red) if applicable
-   if (g_close_time > 0)
+   if (g_range.close_time > 0)
    {
-      ObjectCreate(0, g_close_line_name, OBJ_VLINE, 0, g_close_time, 0);
-      ObjectSetInteger(0, g_close_line_name, OBJPROP_COLOR, clrRed);
-      ObjectSetInteger(0, g_close_line_name, OBJPROP_STYLE, STYLE_SOLID);
-      ObjectSetInteger(0, g_close_line_name, OBJPROP_WIDTH, 2); // Thicker line
-      ObjectSetString(0, g_close_line_name, OBJPROP_TOOLTIP, "Range Close Time");
+      ObjectCreate(0, LINE_CLOSE, OBJ_VLINE, 0, g_range.close_time, 0);
+      ObjectSetInteger(0, LINE_CLOSE, OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, LINE_CLOSE, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, LINE_CLOSE, OBJPROP_WIDTH, 2); // Thicker line
+      ObjectSetString(0, LINE_CLOSE, OBJPROP_TOOLTIP, "Range Close Time");
    }
 
    // Force chart redraw
@@ -1347,8 +1547,8 @@ void DrawRangeLines()
 //+------------------------------------------------------------------+
 void DeleteAllLines()
 {
-   ObjectDelete(0, g_start_line_name);
-   ObjectDelete(0, g_end_line_name);
-   ObjectDelete(0, g_close_line_name);
+   ObjectDelete(0, LINE_START);
+   ObjectDelete(0, LINE_END);
+   ObjectDelete(0, LINE_CLOSE);
    ChartRedraw();
 }
