@@ -165,6 +165,14 @@ const string LINE_END   = "Range_End_Line";
 const string LINE_CLOSE = "Range_Close_Line";
 
 //+------------------------------------------------------------------+
+//| Check if magic number and symbol belong to this EA              |
+//+------------------------------------------------------------------+
+bool BelongsToThisEA(long magic, string symbol)
+{
+   return (magic == magic_number && symbol == _Symbol);
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -467,8 +475,8 @@ void CalculateWeeklyClosedLoss()
       if (deal_ticket > 0)
       {
          // Check if this deal belongs to our EA
-         if (HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) == magic_number &&
-             HistoryDealGetString(deal_ticket, DEAL_SYMBOL) == _Symbol)
+         if (BelongsToThisEA(HistoryDealGetInteger(deal_ticket, DEAL_MAGIC),
+                             HistoryDealGetString(deal_ticket, DEAL_SYMBOL)))
          {
             // Only count exit deals (DEAL_ENTRY_OUT)
             ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
@@ -549,8 +557,8 @@ double GetOpenPositionsFloatingLoss()
       if (position_ticket > 0)
       {
          // Check if this position belongs to our EA
-         if (PositionGetInteger(POSITION_MAGIC) == magic_number &&
-             PositionGetString(POSITION_SYMBOL) == _Symbol)
+         if (BelongsToThisEA(PositionGetInteger(POSITION_MAGIC),
+                             PositionGetString(POSITION_SYMBOL)))
          {
             double position_profit = PositionGetDouble(POSITION_PROFIT);
             double position_swap = PositionGetDouble(POSITION_SWAP);
@@ -776,8 +784,8 @@ void RecoverExistingPositions()
    {
       ulong position_ticket = PositionGetTicket(i);
       if (position_ticket > 0 &&
-          PositionGetInteger(POSITION_MAGIC) == magic_number &&
-          PositionGetString(POSITION_SYMBOL) == _Symbol)
+          BelongsToThisEA(PositionGetInteger(POSITION_MAGIC),
+                          PositionGetString(POSITION_SYMBOL)))
       {
          ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
@@ -803,8 +811,8 @@ void RecoverExistingPositions()
    {
       ulong order_ticket = OrderGetTicket(i);
       if (order_ticket > 0 &&
-          OrderGetInteger(ORDER_MAGIC) == magic_number &&
-          OrderGetString(ORDER_SYMBOL) == _Symbol)
+          BelongsToThisEA(OrderGetInteger(ORDER_MAGIC),
+                          OrderGetString(ORDER_SYMBOL)))
       {
          ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
 
@@ -1275,7 +1283,7 @@ void CloseAllOrders()
       ulong position_ticket = PositionGetTicket(i);
       if (position_ticket > 0)
       {
-         if (PositionGetInteger(POSITION_MAGIC) == magic_number && PositionGetString(POSITION_SYMBOL) == _Symbol)
+         if (BelongsToThisEA(PositionGetInteger(POSITION_MAGIC), PositionGetString(POSITION_SYMBOL)))
          {
             // Get position profit before closing (commission will be retrieved from deal after close)
             double position_profit = PositionGetDouble(POSITION_PROFIT);
@@ -1296,7 +1304,7 @@ void CloseAllOrders()
       ulong order_ticket = OrderGetTicket(i);
       if (order_ticket > 0)
       {
-         if (OrderGetInteger(ORDER_MAGIC) == magic_number && OrderGetString(ORDER_SYMBOL) == _Symbol)
+         if (BelongsToThisEA(OrderGetInteger(ORDER_MAGIC), OrderGetString(ORDER_SYMBOL)))
          {
             trade.OrderDelete(order_ticket);
             if (trade.ResultRetcode() != TRADE_RETCODE_DONE)
@@ -1328,7 +1336,7 @@ void ManageTrailingStop()
       if (position_ticket > 0)
       {
          // Check if this position belongs to our EA
-         if (PositionGetInteger(POSITION_MAGIC) == magic_number && PositionGetString(POSITION_SYMBOL) == _Symbol)
+         if (BelongsToThisEA(PositionGetInteger(POSITION_MAGIC), PositionGetString(POSITION_SYMBOL)))
          {
             // Get position details
             double position_open_price = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -1404,10 +1412,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       return;
    
    // Check if this deal belongs to our EA
-   if (HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != magic_number)
-      return;
-   
-   if (HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol)
+   if (!BelongsToThisEA(HistoryDealGetInteger(deal_ticket, DEAL_MAGIC), HistoryDealGetString(deal_ticket, DEAL_SYMBOL)))
       return;
    
    // Only process exit deals
