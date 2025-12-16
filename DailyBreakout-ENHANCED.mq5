@@ -157,7 +157,6 @@ PriceCache  g_price;
 // Other globals
 datetime g_current_day = 0;
 int g_trailing_points = 300;
-bool g_trailing_activated = false;
 bool g_one_breakout_mode = false;
 
 // Line names (constants)
@@ -676,73 +675,6 @@ int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
    return 0; // Sideways or unclear
 }
 
-//+------------------------------------------------------------------+
-//| Check trend confirmation across multiple timeframes             |
-//+------------------------------------------------------------------+
-bool ConfirmTrendDirection(bool is_bullish_breakout)
-{
-   if (!enable_trend_confirmation)
-      return true; // Trend confirmation disabled
-
-   ENUM_TIMEFRAMES timeframes[] = {PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4};
-   string timeframe_names[] = {"M5", "M15", "H1", "H4"};
-
-   int agreeing_timeframes = 0;
-   int total_timeframes = ArraySize(timeframes);
-
-   Print("=== Trend Confirmation Analysis ===");
-
-   for (int i = 0; i < total_timeframes; i++)
-   {
-      int trend = DetectTrendBySwings(timeframes[i]);
-
-      string trend_str = "Neutral";
-      if (trend == 1)
-         trend_str = "Uptrend";
-      else if (trend == -1)
-         trend_str = "Downtrend";
-
-      Print(timeframe_names[i], " trend: ", trend_str);
-
-      // Check if this timeframe agrees with our breakout direction
-      if (is_bullish_breakout && trend == 1)
-      {
-         agreeing_timeframes++;
-         Print(timeframe_names[i], " confirms bullish breakout");
-      }
-      else if (!is_bullish_breakout && trend == -1)
-      {
-         agreeing_timeframes++;
-         Print(timeframe_names[i], " confirms bearish breakout");
-      }
-      else if (trend == 0)
-      {
-         Print(timeframe_names[i], " is neutral - not counting against confirmation");
-         if (!require_all_timeframes)
-            agreeing_timeframes++; // Allow neutral if not requiring all
-      }
-      else
-      {
-         Print(timeframe_names[i], " conflicts with breakout direction");
-      }
-   }
-
-   int required_timeframes = require_all_timeframes ? total_timeframes : (total_timeframes + 1) / 2;
-
-   Print("Trend confirmation: ", agreeing_timeframes, "/", total_timeframes,
-         " timeframes agree (Required: ", required_timeframes, ")");
-
-   bool confirmed = (agreeing_timeframes >= required_timeframes);
-
-   if (confirmed)
-      Print("✓ Trend confirmation PASSED");
-   else
-      Print("✗ Trend confirmation FAILED - orders will be skipped");
-
-   Print("================================");
-
-   return confirmed;
-}
 
 //+------------------------------------------------------------------+
 //| Optimized trend confirmation - checks both directions in one pass|
@@ -830,17 +762,6 @@ void GetTrendConfirmation(bool &bullish_confirmed, bool &bearish_confirmed)
 }
 
 //+------------------------------------------------------------------+
-//| Log recovery of position or order                                 |
-//+------------------------------------------------------------------+
-void LogRecovery(string type, ulong ticket, double price = 0)
-{
-   if (price > 0)
-      Print("Recovered ", type, " #", ticket, " at ", price);
-   else
-      Print("Recovered ", type, " #", ticket);
-}
-
-//+------------------------------------------------------------------+
 //| Recover existing positions if EA restarts mid-day               |
 //+------------------------------------------------------------------+
 void RecoverExistingPositions()
@@ -863,12 +784,12 @@ void RecoverExistingPositions()
          if (pos_type == POSITION_TYPE_BUY)
          {
             g_order.buy_ticket = position_ticket;
-            LogRecovery("BUY position", position_ticket);
+            Print("Recovered BUY position #", position_ticket);
          }
          else if (pos_type == POSITION_TYPE_SELL)
          {
             g_order.sell_ticket = position_ticket;
-            LogRecovery("SELL position", position_ticket);
+            Print("Recovered SELL position #", position_ticket);
          }
 
          recovered_positions++;
@@ -891,13 +812,13 @@ void RecoverExistingPositions()
          {
             g_order.buy_ticket = order_ticket;
             g_range.high_price = OrderGetDouble(ORDER_PRICE_OPEN);
-            LogRecovery("BUY STOP order", order_ticket, g_range.high_price);
+            Print("Recovered BUY STOP order #", order_ticket, " at ", g_range.high_price);
          }
          else if (order_type == ORDER_TYPE_SELL_STOP)
          {
             g_order.sell_ticket = order_ticket;
             g_range.low_price = OrderGetDouble(ORDER_PRICE_OPEN);
-            LogRecovery("SELL STOP order", order_ticket, g_range.low_price);
+            Print("Recovered SELL STOP order #", order_ticket, " at ", g_range.low_price);
          }
 
          recovered_orders++;
