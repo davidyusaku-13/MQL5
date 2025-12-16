@@ -33,7 +33,6 @@ input bool enable_trend_confirmation = true; // Enable multi-timeframe trend con
 input int trend_swing_period = 10;           // Period for swing highs/lows detection
 input int trend_momentum_period = 5;         // Period for recent momentum check
 input bool require_all_timeframes = true;    // Require all timeframes to agree
-input int trend_cache_seconds = 60;          // Seconds to cache trend confirmation results
 
 // ============================================================================
 // STRUCT DEFINITIONS
@@ -123,7 +122,6 @@ PriceCache  g_price;
 
 // Other globals
 datetime g_current_day = 0;
-int g_trailing_points = 300;
 bool g_one_breakout_mode = false;
 
 // Line names (constants)
@@ -132,11 +130,46 @@ const string LINE_END   = "Range_End_Line";
 const string LINE_CLOSE = "Range_Close_Line";
 
 //+------------------------------------------------------------------+
+//| Get today's date at midnight (00:00:00)                         |
+//+------------------------------------------------------------------+
+datetime GetTodayMidnight()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
+   return StructToTime(dt);
+}
+
+//+------------------------------------------------------------------+
 //| Check if magic number and symbol belong to this EA              |
 //+------------------------------------------------------------------+
 bool BelongsToThisEA(long magic, string symbol)
 {
    return (magic == magic_number && symbol == _Symbol);
+}
+
+//+------------------------------------------------------------------+
+//| Check if position belongs to this EA (selected by ticket)       |
+//+------------------------------------------------------------------+
+bool PositionBelongsToEA(ulong ticket)
+{
+   if (!PositionSelectByTicket(ticket))
+      return false;
+   return BelongsToThisEA(PositionGetInteger(POSITION_MAGIC),
+                          PositionGetString(POSITION_SYMBOL));
+}
+
+//+------------------------------------------------------------------+
+//| Check if order belongs to this EA (selected by ticket)          |
+//+------------------------------------------------------------------+
+bool OrderBelongsToEA(ulong ticket)
+{
+   if (!OrderSelect(ticket))
+      return false;
+   return BelongsToThisEA(OrderGetInteger(ORDER_MAGIC),
+                          OrderGetString(ORDER_SYMBOL));
 }
 
 //+------------------------------------------------------------------+
@@ -222,15 +255,9 @@ int OnInit()
    // Initialize structs
    g_range.Reset();
    g_order.Reset();
-   g_trailing_points = trailing_stop;
 
    // Set current day
-   MqlDateTime dt;
-   TimeCurrent(dt);
-   dt.hour = 0;
-   dt.min = 0;
-   dt.sec = 0;
-   g_current_day = StructToTime(dt);
+   g_current_day = GetTodayMidnight();
 
    // Delete any existing lines
    DeleteAllLines();
@@ -304,12 +331,7 @@ void OnTick()
    g_price.Update();
 
    // Check if day has changed
-   MqlDateTime dt;
-   TimeCurrent(dt);
-   dt.hour = 0;
-   dt.min = 0;
-   dt.sec = 0;
-   datetime today = StructToTime(dt);
+   datetime today = GetTodayMidnight();
 
    if (today != g_current_day)
    {
@@ -542,21 +564,16 @@ double GetOpenPositionsFloatingLoss()
    for (int i = 0; i < PositionsTotal(); i++)
    {
       ulong position_ticket = PositionGetTicket(i);
-      if (position_ticket > 0)
+      if (position_ticket > 0 && PositionBelongsToEA(position_ticket))
       {
-         // Check if this position belongs to our EA
-         if (BelongsToThisEA(PositionGetInteger(POSITION_MAGIC),
-                             PositionGetString(POSITION_SYMBOL)))
-         {
-            double position_profit = PositionGetDouble(POSITION_PROFIT);
-            double position_swap = PositionGetDouble(POSITION_SWAP);
-            double total_pnl = position_profit + position_swap;
+         double position_profit = PositionGetDouble(POSITION_PROFIT);
+         double position_swap = PositionGetDouble(POSITION_SWAP);
+         double total_pnl = position_profit + position_swap;
 
-            // Only count losses (negative PnL)
-            if (total_pnl < 0)
-            {
-               floating_loss += MathAbs(total_pnl);
-            }
+         // Only count losses (negative PnL)
+         if (total_pnl < 0)
+         {
+            floating_loss += MathAbs(total_pnl);
          }
       }
    }
@@ -675,13 +692,18 @@ int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
    bool recent_upward_momentum = GetRecentMomentum(timeframe);
 
    // Determine trend based on swing analysis and momentum
-   if (higher_highs > lower_highs && higher_lows > lower_lows && recent_upward_momentum)
+   bool strong_uptrend = (higher_highs > lower_highs && higher_lows > lower_lows && recent_upward_momentum);
+   bool strong_downtrend = (lower_highs > higher_highs && lower_lows > higher_lows && !recent_upward_momentum);
+   bool weak_uptrend = (higher_highs > lower_highs || (recent_upward_momentum && higher_highs >= lower_highs));
+   bool weak_downtrend = (lower_highs > higher_highs || (!recent_upward_momentum && lower_highs >= higher_highs));
+
+   if (strong_uptrend)
       return 1; // Clear uptrend
-   else if (lower_highs > higher_highs && lower_lows > higher_lows && !recent_upward_momentum)
+   if (strong_downtrend)
       return -1; // Clear downtrend
-   else if (higher_highs > lower_highs || (recent_upward_momentum && higher_highs >= lower_highs))
+   if (weak_uptrend)
       return 1; // Leaning upward with momentum
-   else if (lower_highs > higher_highs || (!recent_upward_momentum && lower_highs >= higher_highs))
+   if (weak_downtrend)
       return -1; // Leaning downward
 
    return 0; // Sideways or unclear
@@ -772,9 +794,7 @@ void RecoverExistingPositions()
    for (int i = 0; i < PositionsTotal(); i++)
    {
       ulong position_ticket = PositionGetTicket(i);
-      if (position_ticket > 0 &&
-          BelongsToThisEA(PositionGetInteger(POSITION_MAGIC),
-                          PositionGetString(POSITION_SYMBOL)))
+      if (position_ticket > 0 && PositionBelongsToEA(position_ticket))
       {
          ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
@@ -799,9 +819,7 @@ void RecoverExistingPositions()
    for (int i = 0; i < OrdersTotal(); i++)
    {
       ulong order_ticket = OrderGetTicket(i);
-      if (order_ticket > 0 &&
-          BelongsToThisEA(OrderGetInteger(ORDER_MAGIC),
-                          OrderGetString(ORDER_SYMBOL)))
+      if (order_ticket > 0 && OrderBelongsToEA(order_ticket))
       {
          ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
 
@@ -831,12 +849,7 @@ void RecoverExistingPositions()
       // Recalculate close time for today
       if (range_close_time > 0)
       {
-         MqlDateTime dt;
-         TimeCurrent(dt);
-         dt.hour = 0;
-         dt.min = 0;
-         dt.sec = 0;
-         datetime today = StructToTime(dt);
+         datetime today = GetTodayMidnight();
          g_range.close_time = today + range_close_time * 60;
          Print("Close time set to: ", TimeToString(g_range.close_time));
       }
@@ -878,17 +891,7 @@ bool IsTradingDay()
 void CalculateDailyRange()
 {
    datetime current_time = TimeCurrent();
-
-   // Calculate range start time (from the start of the day)
-   MqlDateTime dt;
-   TimeToStruct(current_time, dt);
-
-   // Reset time to beginning of day
-   dt.hour = 0;
-   dt.min = 0;
-   dt.sec = 0;
-
-   datetime today = StructToTime(dt);
+   datetime today = GetTodayMidnight();
 
    // Calculate range start time
    g_range.start_time = today + range_start_time * 60;
@@ -1229,19 +1232,16 @@ void CloseAllOrders()
    for (int i = positions_total - 1; i >= 0; i--)
    {
       ulong position_ticket = PositionGetTicket(i);
-      if (position_ticket > 0)
+      if (position_ticket > 0 && PositionBelongsToEA(position_ticket))
       {
-         if (BelongsToThisEA(PositionGetInteger(POSITION_MAGIC), PositionGetString(POSITION_SYMBOL)))
-         {
-            // Get position profit before closing (commission will be retrieved from deal after close)
-            double position_profit = PositionGetDouble(POSITION_PROFIT);
-            double position_swap = PositionGetDouble(POSITION_SWAP);
-            
-            trade.PositionClose(position_ticket);
-            if (trade.ResultRetcode() != TRADE_RETCODE_DONE)
-               Print("Failed to close position #", position_ticket, ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
-            // Note: Weekly loss tracking is handled by OnTradeTransaction event
-         }
+         // Get position profit before closing (commission will be retrieved from deal after close)
+         double position_profit = PositionGetDouble(POSITION_PROFIT);
+         double position_swap = PositionGetDouble(POSITION_SWAP);
+
+         trade.PositionClose(position_ticket);
+         if (trade.ResultRetcode() != TRADE_RETCODE_DONE)
+            Print("Failed to close position #", position_ticket, ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+         // Note: Weekly loss tracking is handled by OnTradeTransaction event
       }
    }
 
@@ -1250,14 +1250,11 @@ void CloseAllOrders()
    for (int i = orders_total - 1; i >= 0; i--)
    {
       ulong order_ticket = OrderGetTicket(i);
-      if (order_ticket > 0)
+      if (order_ticket > 0 && OrderBelongsToEA(order_ticket))
       {
-         if (BelongsToThisEA(OrderGetInteger(ORDER_MAGIC), OrderGetString(ORDER_SYMBOL)))
-         {
-            trade.OrderDelete(order_ticket);
-            if (trade.ResultRetcode() != TRADE_RETCODE_DONE)
-               Print("Failed to delete order #", order_ticket, ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
-         }
+         trade.OrderDelete(order_ticket);
+         if (trade.ResultRetcode() != TRADE_RETCODE_DONE)
+            Print("Failed to delete order #", order_ticket, ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
       }
    }
 
@@ -1281,58 +1278,54 @@ void ManageTrailingStop()
    {
       ulong position_ticket = PositionGetTicket(i);
 
-      if (position_ticket > 0)
+      if (position_ticket > 0 && PositionBelongsToEA(position_ticket))
       {
-         // Check if this position belongs to our EA
-         if (BelongsToThisEA(PositionGetInteger(POSITION_MAGIC), PositionGetString(POSITION_SYMBOL)))
+         // Get position details
+         double position_open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+         double position_sl = PositionGetDouble(POSITION_SL);
+         double position_tp = PositionGetDouble(POSITION_TP);
+         ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+         // Current price depending on position type (use cached prices)
+         double current_price = (position_type == POSITION_TYPE_BUY) ? g_price.bid : g_price.ask;
+
+         // Calculate current profit in points
+         double profit_points = 0;
+
+         if (position_type == POSITION_TYPE_BUY)
+            profit_points = (current_price - position_open_price) / _Point;
+         else
+            profit_points = (position_open_price - current_price) / _Point;
+
+         // If profit has not reached trailing_start, skip
+         if (profit_points < trailing_start)
+            continue;
+
+         // Calculate new stop loss level
+         double new_sl = 0;
+
+         if (position_type == POSITION_TYPE_BUY)
          {
-            // Get position details
-            double position_open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-            double position_sl = PositionGetDouble(POSITION_SL);
-            double position_tp = PositionGetDouble(POSITION_TP);
-            ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            // For buy positions, trail below current price
+            new_sl = current_price - trailing_stop * _Point;
 
-            // Current price depending on position type (use cached prices)
-            double current_price = (position_type == POSITION_TYPE_BUY) ? g_price.bid : g_price.ask;
-
-            // Calculate current profit in points
-            double profit_points = 0;
-
-            if (position_type == POSITION_TYPE_BUY)
-               profit_points = (current_price - position_open_price) / _Point;
-            else
-               profit_points = (position_open_price - current_price) / _Point;
-
-            // If profit has not reached trailing_start, skip
-            if (profit_points < trailing_start)
-               continue;
-
-            // Calculate new stop loss level
-            double new_sl = 0;
-
-            if (position_type == POSITION_TYPE_BUY)
+            // Only modify if new SL is higher than current SL
+            if (position_sl == 0 || new_sl > position_sl)
             {
-               // For buy positions, trail below current price
-               new_sl = current_price - trailing_stop * _Point;
-
-               // Only modify if new SL is higher than current SL
-               if (position_sl == 0 || new_sl > position_sl)
-               {
-                  trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
-               }
+               trade.PositionModify(position_ticket, new_sl, position_tp);
+               Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
             }
-            else
-            {
-               // For sell positions, trail above current price
-               new_sl = current_price + trailing_stop * _Point;
+         }
+         else
+         {
+            // For sell positions, trail above current price
+            new_sl = current_price + trailing_stop * _Point;
 
-               // Only modify if new SL is lower than current SL or no SL is set
-               if (position_sl == 0 || new_sl < position_sl)
-               {
-                  trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
-               }
+            // Only modify if new SL is lower than current SL or no SL is set
+            if (position_sl == 0 || new_sl < position_sl)
+            {
+               trade.PositionModify(position_ticket, new_sl, position_tp);
+               Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
             }
          }
       }
