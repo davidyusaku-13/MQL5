@@ -96,37 +96,6 @@ struct WeeklyState
    }
 };
 
-// Trend confirmation caching
-struct TrendCache
-{
-   datetime cache_time;
-   bool     bullish_confirmed;
-   bool     bearish_confirmed;
-
-   void Reset()
-   {
-      cache_time = 0;
-      bullish_confirmed = false;
-      bearish_confirmed = false;
-   }
-};
-
-// Range statistics tracking
-struct RangeStats
-{
-   double   max_range_ever;
-   double   min_range_ever;
-   datetime max_range_date;
-   datetime min_range_date;
-
-   void Init()
-   {
-      max_range_ever = 0;
-      min_range_ever = 999999;
-      max_range_date = 0;
-      min_range_date = 0;
-   }
-};
 
 // Price cache
 struct PriceCache
@@ -150,8 +119,6 @@ struct PriceCache
 RangeState  g_range;
 OrderState  g_order;
 WeeklyState g_weekly;
-TrendCache  g_trend;
-RangeStats  g_stats;
 PriceCache  g_price;
 
 // Other globals
@@ -170,6 +137,50 @@ const string LINE_CLOSE = "Range_Close_Line";
 bool BelongsToThisEA(long magic, string symbol)
 {
    return (magic == magic_number && symbol == _Symbol);
+}
+
+//+------------------------------------------------------------------+
+//| Get ticket status - Returns: 0=not found, 1=open position, 2=pending order |
+//+------------------------------------------------------------------+
+int GetTicketStatus(ulong ticket, ENUM_POSITION_TYPE &pos_type, ENUM_ORDER_TYPE &order_type)
+{
+   if (PositionSelectByTicket(ticket))
+   {
+      pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      return 1;
+   }
+   else if (OrderSelect(ticket))
+   {
+      order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      return 2;
+   }
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Validate deal and get PnL - Returns true if deal belongs to EA and is exit deal |
+//+------------------------------------------------------------------+
+bool ValidateAndGetDealPnL(ulong deal_ticket, double &total_pnl)
+{
+   if (!HistoryDealSelect(deal_ticket))
+      return false;
+
+   if (HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != magic_number)
+      return false;
+
+   if (HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol)
+      return false;
+
+   ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+   if (deal_entry != DEAL_ENTRY_OUT && deal_entry != DEAL_ENTRY_INOUT)
+      return false;
+
+   double deal_profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+   double deal_swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+   double deal_commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+   total_pnl = deal_profit + deal_swap + deal_commission;
+
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -211,8 +222,6 @@ int OnInit()
    // Initialize structs
    g_range.Reset();
    g_order.Reset();
-   g_trend.Reset();
-   g_stats.Init();
    g_trailing_points = trailing_stop;
 
    // Set current day
@@ -247,14 +256,6 @@ void OnDeinit(const int reason)
    Print("===============================================");
    Print("           DAILY BREAKOUT EA REPORT           ");
    Print("===============================================");
-
-   if (g_stats.max_range_ever > 0)
-   {
-      Print("=== Range Statistics ===");
-      Print("Maximum range during backtest: ", g_stats.max_range_ever, " points on ", TimeToString(g_stats.max_range_date));
-      Print("Minimum range during backtest: ", g_stats.min_range_ever, " points on ", TimeToString(g_stats.min_range_date));
-      Print("======================");
-   }
 
    if (enable_trend_confirmation)
    {
@@ -315,7 +316,6 @@ void OnTick()
       // New day, reset EA
       g_range.Reset();
       g_order.Reset();
-      g_trend.Reset();
       g_current_day = today;
       DeleteAllLines();
 
@@ -459,45 +459,33 @@ void CalculateWeeklyClosedLoss()
       return;
 
    g_weekly.closed_loss = 0;
-   
+
    // Select history from week start to now
    if (!HistorySelect(g_weekly.week_start, TimeCurrent()))
    {
       Print("Warning: Could not select trade history for weekly loss calculation");
       return;
    }
-   
+
    int total_deals = HistoryDealsTotal();
-   
+
    for (int i = 0; i < total_deals; i++)
    {
       ulong deal_ticket = HistoryDealGetTicket(i);
       if (deal_ticket > 0)
       {
-         // Check if this deal belongs to our EA
-         if (BelongsToThisEA(HistoryDealGetInteger(deal_ticket, DEAL_MAGIC),
-                             HistoryDealGetString(deal_ticket, DEAL_SYMBOL)))
+         double total_pnl;
+         if (ValidateAndGetDealPnL(deal_ticket, total_pnl))
          {
-            // Only count exit deals (DEAL_ENTRY_OUT)
-            ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
-            if (deal_entry == DEAL_ENTRY_OUT || deal_entry == DEAL_ENTRY_INOUT)
+            // Only track losses (negative PnL)
+            if (total_pnl < 0)
             {
-               double deal_profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
-               double deal_swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
-               double deal_commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
-               
-               double total_pnl = deal_profit + deal_swap + deal_commission;
-               
-               // Only track losses (negative PnL)
-               if (total_pnl < 0)
-               {
-                  g_weekly.closed_loss += MathAbs(total_pnl);
-               }
+               g_weekly.closed_loss += MathAbs(total_pnl);
             }
          }
       }
    }
-   
+
    // Check if weekly limit is already reached
    CheckWeeklyLossLimit();
 }
@@ -596,40 +584,16 @@ void UpdateWeeklyLossOnClose(double closed_pnl)
 }
 
 //+------------------------------------------------------------------+
-//| Detect trend based on higher highs/lower lows pattern           |
+//| Count swing points (higher/lower highs and lows)                |
 //+------------------------------------------------------------------+
-int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
+void CountSwingPoints(const double &highs[], const double &lows[],
+                      int &higher_highs, int &lower_highs,
+                      int &higher_lows, int &lower_lows)
 {
-   // Return: 1 = Uptrend (higher highs and higher lows)
-   // Return: -1 = Downtrend (lower highs and lower lows)
-   // Return: 0 = Sideways/No clear trend
-
-   // Defensive parameter validation
-   if (trend_swing_period <= trend_momentum_period + 1 || trend_momentum_period < 1)
-      return 0;  // Invalid parameters
-
-   int bars_needed = trend_swing_period * 3; // Need enough bars for analysis
-   if (Bars(_Symbol, timeframe) < bars_needed)
-      return 0; // Not enough data
-
-   double highs[], lows[];
-   ArraySetAsSeries(highs, true);
-   ArraySetAsSeries(lows, true);
-
-   // Copy high and low data
-   int copied = CopyHigh(_Symbol, timeframe, 0, bars_needed, highs);
-   if (copied < bars_needed)
-      return 0;
-
-   copied = CopyLow(_Symbol, timeframe, 0, bars_needed, lows);
-   if (copied < bars_needed)
-      return 0;
-
-   // Find recent swing highs and lows
-   int higher_highs = 0;
-   int lower_highs = 0;
-   int higher_lows = 0;
-   int lower_lows = 0;
+   higher_highs = 0;
+   lower_highs = 0;
+   higher_lows = 0;
+   lower_lows = 0;
 
    // Analyze swing points over the specified period
    for (int i = trend_momentum_period; i < trend_swing_period; i++)
@@ -658,17 +622,57 @@ int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
          }
       }
    }
+}
 
-   // Check recent momentum (last few bars)
+//+------------------------------------------------------------------+
+//| Get recent momentum direction                                    |
+//+------------------------------------------------------------------+
+bool GetRecentMomentum(ENUM_TIMEFRAMES timeframe)
+{
    double current_price = (g_price.bid + g_price.ask) / 2;
    double old_price = 0;
 
-   double closes[];  // Use separate array for close prices
+   double closes[];
    ArraySetAsSeries(closes, true);
    if (CopyClose(_Symbol, timeframe, trend_momentum_period, 1, closes) > 0)
       old_price = closes[0];
 
-   bool recent_upward_momentum = (current_price > old_price);
+   return (current_price > old_price);
+}
+
+//+------------------------------------------------------------------+
+//| Detect trend based on higher highs/lower lows pattern           |
+//+------------------------------------------------------------------+
+int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
+{
+   // Return: 1 = Uptrend (higher highs and higher lows)
+   // Return: -1 = Downtrend (lower highs and lower lows)
+   // Return: 0 = Sideways/No clear trend
+
+   // Defensive parameter validation
+   if (trend_swing_period <= trend_momentum_period + 1 || trend_momentum_period < 1)
+      return 0;  // Invalid parameters
+
+   int bars_needed = trend_swing_period * 3;
+   if (Bars(_Symbol, timeframe) < bars_needed)
+      return 0; // Not enough data
+
+   double highs[], lows[];
+   ArraySetAsSeries(highs, true);
+   ArraySetAsSeries(lows, true);
+
+   // Copy high and low data
+   if (CopyHigh(_Symbol, timeframe, 0, bars_needed, highs) < bars_needed)
+      return 0;
+   if (CopyLow(_Symbol, timeframe, 0, bars_needed, lows) < bars_needed)
+      return 0;
+
+   // Count swing points
+   int higher_highs, lower_highs, higher_lows, lower_lows;
+   CountSwingPoints(highs, lows, higher_highs, lower_highs, higher_lows, lower_lows);
+
+   // Get recent momentum
+   bool recent_upward_momentum = GetRecentMomentum(timeframe);
 
    // Determine trend based on swing analysis and momentum
    if (higher_highs > lower_highs && higher_lows > lower_lows && recent_upward_momentum)
@@ -696,15 +700,6 @@ void GetTrendConfirmation(bool &bullish_confirmed, bool &bearish_confirmed)
    {
       bullish_confirmed = true;
       bearish_confirmed = true;
-      return;
-   }
-
-   // Check if cached results are still valid
-   if (g_trend.cache_time > 0 && (TimeCurrent() - g_trend.cache_time) < trend_cache_seconds)
-   {
-      bullish_confirmed = g_trend.bullish_confirmed;
-      bearish_confirmed = g_trend.bearish_confirmed;
-      Print("Using cached trend confirmation (age: ", (TimeCurrent() - g_trend.cache_time), "s)");
       return;
    }
 
@@ -756,16 +751,10 @@ void GetTrendConfirmation(bool &bullish_confirmed, bool &bearish_confirmed)
    bullish_confirmed = (bullish_agreeing >= required_timeframes);
    bearish_confirmed = (bearish_agreeing >= required_timeframes);
 
-   // Cache the results
-   g_trend.cache_time = TimeCurrent();
-   g_trend.bullish_confirmed = bullish_confirmed;
-   g_trend.bearish_confirmed = bearish_confirmed;
-
    Print("Bullish confirmation: ", bullish_agreeing, "/", total_timeframes,
          " (Required: ", required_timeframes, ") - ", (bullish_confirmed ? "PASSED" : "FAILED"));
    Print("Bearish confirmation: ", bearish_agreeing, "/", total_timeframes,
          " (Required: ", required_timeframes, ") - ", (bearish_confirmed ? "PASSED" : "FAILED"));
-   Print("Trend confirmation cached for ", trend_cache_seconds, " seconds");
    Print("================================");
 }
 
@@ -952,21 +941,6 @@ void CalculateDailyRange()
       g_range.calculated = true;
       double range_size = g_range.high_price - g_range.low_price;
       double range_points = range_size / _Point;
-
-      // Track maximum and minimum ranges observed
-      if (range_points > g_stats.max_range_ever)
-      {
-         g_stats.max_range_ever = range_points;
-         g_stats.max_range_date = TimeCurrent();
-         Print("New maximum range detected: ", range_points, " points on ", TimeToString(g_stats.max_range_date));
-      }
-
-      if (range_points < g_stats.min_range_ever)
-      {
-         g_stats.min_range_ever = range_points;
-         g_stats.min_range_date = TimeCurrent();
-         Print("New minimum range detected: ", range_points, " points on ", TimeToString(g_stats.min_range_date));
-      }
 
       Print("Daily range calculated - High: ", g_range.high_price, " Low: ", g_range.low_price,
             " Range: ", range_points, " points");
@@ -1206,66 +1180,40 @@ void ManageOrders()
    {
       bool buy_triggered = false;
       bool sell_triggered = false;
+      ENUM_POSITION_TYPE pos_type;
+      ENUM_ORDER_TYPE order_type;
 
       // Check buy ticket status
       if (g_order.buy_ticket > 0)
       {
-         // First check if it became a position (stop order was triggered)
-         if (PositionSelectByTicket(g_order.buy_ticket))
-         {
-            if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-               buy_triggered = true;
-         }
-         // If not a position, check if pending order still exists
-         else if (OrderSelect(g_order.buy_ticket))
-         {
-            // Order still pending, not triggered yet
-            buy_triggered = false;
-         }
-         else
-         {
-            // Neither position nor order exists - was closed or cancelled
-            g_order.buy_ticket = 0;
-         }
+         int status = GetTicketStatus(g_order.buy_ticket, pos_type, order_type);
+         if (status == 1 && pos_type == POSITION_TYPE_BUY)
+            buy_triggered = true;
+         else if (status == 0)
+            g_order.buy_ticket = 0; // Neither position nor order exists
       }
 
       // Check sell ticket status
       if (g_order.sell_ticket > 0)
       {
-         // First check if it became a position (stop order was triggered)
-         if (PositionSelectByTicket(g_order.sell_ticket))
-         {
-            if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-               sell_triggered = true;
-         }
-         // If not a position, check if pending order still exists
-         else if (OrderSelect(g_order.sell_ticket))
-         {
-            // Order still pending, not triggered yet
-            sell_triggered = false;
-         }
-         else
-         {
-            // Neither position nor order exists - was closed or cancelled
-            g_order.sell_ticket = 0;
-         }
+         int status = GetTicketStatus(g_order.sell_ticket, pos_type, order_type);
+         if (status == 1 && pos_type == POSITION_TYPE_SELL)
+            sell_triggered = true;
+         else if (status == 0)
+            g_order.sell_ticket = 0; // Neither position nor order exists
       }
 
       // If one order has been triggered, delete the other pending order
       if (buy_triggered && g_order.sell_ticket > 0)
       {
          if (OrderSelect(g_order.sell_ticket))
-         {
             trade.OrderDelete(g_order.sell_ticket);
-         }
          g_order.sell_ticket = 0;
       }
       else if (sell_triggered && g_order.buy_ticket > 0)
       {
          if (OrderSelect(g_order.buy_ticket))
-         {
             trade.OrderDelete(g_order.buy_ticket);
-         }
          g_order.buy_ticket = 0;
       }
    }
@@ -1401,33 +1349,19 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    // Only process deal additions (closed trades)
    if (trans.type != TRADE_TRANSACTION_DEAL_ADD)
       return;
-   
+
    // Get deal information
    ulong deal_ticket = trans.deal;
    if (deal_ticket == 0)
       return;
-   
-   // Select the deal from history
-   if (!HistoryDealSelect(deal_ticket))
+
+   // Validate deal and get PnL
+   double total_pnl;
+   if (!ValidateAndGetDealPnL(deal_ticket, total_pnl))
       return;
-   
-   // Check if this deal belongs to our EA
-   if (!BelongsToThisEA(HistoryDealGetInteger(deal_ticket, DEAL_MAGIC), HistoryDealGetString(deal_ticket, DEAL_SYMBOL)))
-      return;
-   
-   // Only process exit deals
-   ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
-   if (deal_entry != DEAL_ENTRY_OUT && deal_entry != DEAL_ENTRY_INOUT)
-      return;
-   
-   // Calculate total PnL for this deal
-   double deal_profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
-   double deal_swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
-   double deal_commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
-   double total_pnl = deal_profit + deal_swap + deal_commission;
-   
+
    Print("Trade closed - Deal #", deal_ticket, " PnL: $", NormalizeDouble(total_pnl, 2));
-   
+
    // Update weekly loss tracking
    UpdateWeeklyLossOnClose(total_pnl);
 }
