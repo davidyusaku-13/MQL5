@@ -75,14 +75,7 @@ private:
    int               m_orderCount;
    int               m_fontSize;
 
-   // Symbol change detection
-   string            m_currentSymbol;
-   
-   // Price change tracking for performance optimization
-   double            m_lastBidPrice;        // Track last bid to avoid redundant updates
-   
    // Debounced save tracking
-   bool              m_inputsDirty;         // Flag indicating unsaved changes
    datetime          m_lastInputChangeTime; // Time of last input modification
    int               m_debounceSeconds;     // Debounce delay (default 3 seconds)
    bool              m_dataLoadedFromDisk;  // Track if current data was loaded vs defaults
@@ -107,8 +100,11 @@ private:
    int               m_saveIntervalSeconds;
 
 public:
+   // Symbol change detection (public for OnChartEvent access)
+   string            m_currentSymbol;
+   bool              m_inputsDirty;         // Flag indicating unsaved changes
+
                      CTradeUtilityDialog();
-                    ~CTradeUtilityDialog();
    virtual bool      Create(const long chart, const string name, const int subwin, const int x1, const int y1, const int x2, const int y2);
    void              SetFontSize(int fontSize) { m_fontSize = fontSize; }
    virtual void      OnTick();
@@ -125,16 +121,22 @@ public:
    void              UpdateDataStatusLabel();
    bool              ValidateInputData(string riskPercent, string entryPrice, string sl, string tp1, string tp2, string tp3, string tp4);
    void              ApplyInputsToUI(string riskPercent, string orderType, string entryPrice, string orderCount, string sl, string tp1, string tp2, string tp3, string tp4, string breakeven);
+   void              UpdateSymbolInfo();
+   void              CalculateLotSize();
+   void              UpdateDollarValues();
 
 protected:
    virtual bool      CreateControls();
+   bool              CreateTPField(int tpNum, int &y, int row_height, int x1, int x2, int x3, int x4, CLabel &lblTP, CLabel &lblTPValue, CEdit &edtTP);
+   void              CalculateTPDollarValue(double tpPrice, double entryPrice, double lotSize, CLabel &label, int minOrderCount);
+   void              CollectTPValues(string symbol, ulong magicNumber, double &tpValues[]);
+   bool              IsBreakevenActivated(string symbol, ulong magicNumber);
+   string            BuildInputCSVLine(string symbol, string riskPercent, string orderType, string entryPrice, string orderCount, string sl, string tp1, string tp2, string tp3, string tp4, string breakeven);
+   bool              BelongsToThisEA(string comment);
    virtual void      OnChangeOrderType();
    virtual void      OnChangeOrderCount();
    void              UpdateButtonLabels();
    void              UpdateTPFields();
-   void              UpdateSymbolInfo();
-   void              CalculateLotSize();
-   void              UpdateDollarValues();
    void              OnClickBuy();
    void              OnClickSell();
    void              ExecuteTrade(bool isBuy);
@@ -162,23 +164,15 @@ CTradeUtilityDialog::CTradeUtilityDialog()
    m_inputsFile = "TradeUtility_Inputs.csv";
    m_lastSaveTime = 0;
    m_saveIntervalSeconds = AutoSaveIntervalSeconds;  // From input parameter
-   
+
    // Initialize symbol tracking and debounce
    m_currentSymbol = _Symbol;
-   m_lastBidPrice = 0;
    m_inputsDirty = false;
    m_lastInputChangeTime = 0;
    m_debounceSeconds = 3;  // Save 3 seconds after last input change
    m_dataLoadedFromDisk = false;
    m_setupsDirty = false;
 }
-
-//+------------------------------------------------------------------+
-//| Destructor                                                        |
-//+------------------------------------------------------------------+
-CTradeUtilityDialog::~CTradeUtilityDialog()
-  {
-  }
 
 //+------------------------------------------------------------------+
 //| Set font size for ComboBox internal objects                      |
@@ -194,6 +188,70 @@ void CTradeUtilityDialog::SetComboBoxFontSize(CComboBox &combobox, int fontSize)
    // Note: The dropdown button (BmpButton) and ListView don't support font size changes
    // as they use bitmap images and have their own internal structure
   }
+
+//+------------------------------------------------------------------+
+//| Create a TP field (label, value label, and edit control)        |
+//+------------------------------------------------------------------+
+bool CTradeUtilityDialog::CreateTPField(int tpNum, int &y, int row_height, int x1, int x2, int x3, int x4, CLabel &lblTP, CLabel &lblTPValue, CEdit &edtTP)
+{
+   string tpLabel = "TP" + IntegerToString(tpNum);
+
+   // Create TP label
+   if(!lblTP.Create(m_chart_id, m_name+"Lbl"+tpLabel, m_subwin, x1, y, x1+30, y+20))
+      return false;
+   lblTP.Text(tpLabel);
+   lblTP.FontSize(m_fontSize);
+   if(!Add(lblTP))
+      return false;
+
+   // Create TP dollar value label
+   if(!lblTPValue.Create(m_chart_id, m_name+"Lbl"+tpLabel+"Value", m_subwin, x1+35, y, x2, y+20))
+      return false;
+   lblTPValue.Text("$0.00");
+   lblTPValue.Color(clrGreen);
+   lblTPValue.FontSize(m_fontSize);
+   if(!Add(lblTPValue))
+      return false;
+
+   // Create TP edit field
+   if(!edtTP.Create(m_chart_id, m_name+"Edt"+tpLabel, m_subwin, x3, y, x4, y+20))
+      return false;
+   edtTP.Text("0.00");
+   edtTP.Color(clrGreen);
+   edtTP.FontSize(m_fontSize);
+
+   // TP2, TP3, TP4 start as read-only (will be enabled based on order count)
+   if(tpNum > 1)
+   {
+      edtTP.ReadOnly(true);
+      edtTP.ColorBackground(C'240,240,240');
+   }
+
+   if(!Add(edtTP))
+      return false;
+
+   y += row_height;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate and update dollar value for a TP level                |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::CalculateTPDollarValue(double tpPrice, double entryPrice, double lotSize, CLabel &label, int minOrderCount)
+{
+   if(tpPrice != 0 && m_orderCount >= minOrderCount && entryPrice != 0 && lotSize != 0)
+   {
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double tpDistance = MathAbs(tpPrice - entryPrice);
+      double tpDollar = (tpDistance / tickSize) * tickValue * lotSize;
+      label.Text("$" + DoubleToString(tpDollar, 2));
+   }
+   else
+   {
+      label.Text("$0.00");
+   }
+}
 
 //+------------------------------------------------------------------+
 //| Create                                                            |
@@ -387,114 +445,20 @@ bool CTradeUtilityDialog::CreateControls()
    y += row_height;
 
    // TP1
-   if(!m_lblTP1.Create(m_chart_id, m_name+"LblTP1", m_subwin, x1, y, x1+30, y+20))
+   if(!CreateTPField(1, y, row_height, x1, x2, x3, x4, m_lblTP1, m_lblTP1Value, m_edtTP1))
       return false;
-   m_lblTP1.Text("TP1");
-   m_lblTP1.FontSize(m_fontSize);
-   if(!Add(m_lblTP1))
-      return false;
-
-   if(!m_lblTP1Value.Create(m_chart_id, m_name+"LblTP1Value", m_subwin, x1+35, y, x2, y+20))
-      return false;
-   m_lblTP1Value.Text("$0.00");
-   m_lblTP1Value.Color(clrGreen);
-   m_lblTP1Value.FontSize(m_fontSize);
-   if(!Add(m_lblTP1Value))
-      return false;
-
-   if(!m_edtTP1.Create(m_chart_id, m_name+"EdtTP1", m_subwin, x3, y, x4, y+20))
-      return false;
-   m_edtTP1.Text("0.00");
-   m_edtTP1.Color(clrGreen);
-   m_edtTP1.FontSize(m_fontSize);
-   if(!Add(m_edtTP1))
-      return false;
-
-   y += row_height;
 
    // TP2
-   if(!m_lblTP2.Create(m_chart_id, m_name+"LblTP2", m_subwin, x1, y, x1+30, y+20))
+   if(!CreateTPField(2, y, row_height, x1, x2, x3, x4, m_lblTP2, m_lblTP2Value, m_edtTP2))
       return false;
-   m_lblTP2.Text("TP2");
-   m_lblTP2.FontSize(m_fontSize);
-   if(!Add(m_lblTP2))
-      return false;
-
-   if(!m_lblTP2Value.Create(m_chart_id, m_name+"LblTP2Value", m_subwin, x1+35, y, x2, y+20))
-      return false;
-   m_lblTP2Value.Text("$0.00");
-   m_lblTP2Value.Color(clrGreen);
-   m_lblTP2Value.FontSize(m_fontSize);
-   if(!Add(m_lblTP2Value))
-      return false;
-
-   if(!m_edtTP2.Create(m_chart_id, m_name+"EdtTP2", m_subwin, x3, y, x4, y+20))
-      return false;
-   m_edtTP2.Text("0.00");
-   m_edtTP2.Color(clrGreen);
-   m_edtTP2.ReadOnly(true);
-   m_edtTP2.ColorBackground(C'240,240,240');
-   m_edtTP2.FontSize(m_fontSize);
-   if(!Add(m_edtTP2))
-      return false;
-
-   y += row_height;
 
    // TP3
-   if(!m_lblTP3.Create(m_chart_id, m_name+"LblTP3", m_subwin, x1, y, x1+30, y+20))
+   if(!CreateTPField(3, y, row_height, x1, x2, x3, x4, m_lblTP3, m_lblTP3Value, m_edtTP3))
       return false;
-   m_lblTP3.Text("TP3");
-   m_lblTP3.FontSize(m_fontSize);
-   if(!Add(m_lblTP3))
-      return false;
-
-   if(!m_lblTP3Value.Create(m_chart_id, m_name+"LblTP3Value", m_subwin, x1+35, y, x2, y+20))
-      return false;
-   m_lblTP3Value.Text("$0.00");
-   m_lblTP3Value.Color(clrGreen);
-   m_lblTP3Value.FontSize(m_fontSize);
-   if(!Add(m_lblTP3Value))
-      return false;
-
-   if(!m_edtTP3.Create(m_chart_id, m_name+"EdtTP3", m_subwin, x3, y, x4, y+20))
-      return false;
-   m_edtTP3.Text("0.00");
-   m_edtTP3.Color(clrGreen);
-   m_edtTP3.ReadOnly(true);
-   m_edtTP3.ColorBackground(C'240,240,240');
-   m_edtTP3.FontSize(m_fontSize);
-   if(!Add(m_edtTP3))
-      return false;
-
-   y += row_height;
 
    // TP4
-   if(!m_lblTP4.Create(m_chart_id, m_name+"LblTP4", m_subwin, x1, y, x1+30, y+20))
+   if(!CreateTPField(4, y, row_height, x1, x2, x3, x4, m_lblTP4, m_lblTP4Value, m_edtTP4))
       return false;
-   m_lblTP4.Text("TP4");
-   m_lblTP4.FontSize(m_fontSize);
-   if(!Add(m_lblTP4))
-      return false;
-
-   if(!m_lblTP4Value.Create(m_chart_id, m_name+"LblTP4Value", m_subwin, x1+35, y, x2, y+20))
-      return false;
-   m_lblTP4Value.Text("$0.00");
-   m_lblTP4Value.Color(clrGreen);
-   m_lblTP4Value.FontSize(m_fontSize);
-   if(!Add(m_lblTP4Value))
-      return false;
-
-   if(!m_edtTP4.Create(m_chart_id, m_name+"EdtTP4", m_subwin, x3, y, x4, y+20))
-      return false;
-   m_edtTP4.Text("0.00");
-   m_edtTP4.Color(clrGreen);
-   m_edtTP4.ReadOnly(true);
-   m_edtTP4.ColorBackground(C'240,240,240');
-   m_edtTP4.FontSize(m_fontSize);
-   if(!Add(m_edtTP4))
-      return false;
-
-   y += row_height;
 
    // Breakeven
    if(!m_lblBreakeven.Create(m_chart_id, m_name+"LblBreakeven", m_subwin, x1, y, x2, y+20))
@@ -792,84 +756,130 @@ void CTradeUtilityDialog::UpdateDollarValues()
       m_lblSLValue.Text("$0.00 (Total)");
    }
 
-   // Calculate TP1 dollar value
-   double tp1Price = StringToDouble(m_edtTP1.Text());
-   if(tp1Price != 0)
+   // Calculate TP dollar values using helper
+   CalculateTPDollarValue(StringToDouble(m_edtTP1.Text()), entryPrice, lotSize, m_lblTP1Value, 1);
+   CalculateTPDollarValue(StringToDouble(m_edtTP2.Text()), entryPrice, lotSize, m_lblTP2Value, 2);
+   CalculateTPDollarValue(StringToDouble(m_edtTP3.Text()), entryPrice, lotSize, m_lblTP3Value, 3);
+   CalculateTPDollarValue(StringToDouble(m_edtTP4.Text()), entryPrice, lotSize, m_lblTP4Value, 4);
+}
+
+//+------------------------------------------------------------------+
+//| Collect TP values from orders and positions for a magic number  |
+//+------------------------------------------------------------------+
+void CTradeUtilityDialog::CollectTPValues(string symbol, ulong magicNumber, double &tpValues[])
+{
+   ArrayResize(tpValues, 4);
+   for(int i = 0; i < 4; i++)
+      tpValues[i] = 0;
+
+   int tpIndex = 0;
+   int totalOrders = OrdersTotal();
+   int totalPositions = PositionsTotal();
+
+   // Scan pending orders for TP values
+   for(int j = 0; j < totalOrders; j++)
    {
-      double tp1Distance = MathAbs(tp1Price - entryPrice);
-      double tp1Dollar = (tp1Distance / tickSize) * tickValue * lotSize;
-      m_lblTP1Value.Text("$" + DoubleToString(tp1Dollar, 2));
-   }
-   else
-   {
-      m_lblTP1Value.Text("$0.00");
+      ulong ticket = OrderGetTicket(j);
+      if(ticket > 0)
+      {
+         if(OrderGetString(ORDER_SYMBOL) == symbol &&
+            OrderGetInteger(ORDER_MAGIC) == magicNumber)
+         {
+            double orderTP = OrderGetDouble(ORDER_TP);
+            if(orderTP > 0 && tpIndex < 4)
+            {
+               tpValues[tpIndex] = orderTP;
+               tpIndex++;
+            }
+         }
+      }
    }
 
-   // Calculate TP2 dollar value
-   double tp2Price = StringToDouble(m_edtTP2.Text());
-   if(tp2Price != 0 && m_orderCount >= 2)
+   // Scan open positions for TP values (for filled orders)
+   for(int p = 0; p < totalPositions; p++)
    {
-      double tp2Distance = MathAbs(tp2Price - entryPrice);
-      double tp2Dollar = (tp2Distance / tickSize) * tickValue * lotSize;
-      m_lblTP2Value.Text("$" + DoubleToString(tp2Dollar, 2));
-   }
-   else
-   {
-      m_lblTP2Value.Text("$0.00");
-   }
-
-   // Calculate TP3 dollar value
-   double tp3Price = StringToDouble(m_edtTP3.Text());
-   if(tp3Price != 0 && m_orderCount >= 3)
-   {
-      double tp3Distance = MathAbs(tp3Price - entryPrice);
-      double tp3Dollar = (tp3Distance / tickSize) * tickValue * lotSize;
-      m_lblTP3Value.Text("$" + DoubleToString(tp3Dollar, 2));
-   }
-   else
-   {
-      m_lblTP3Value.Text("$0.00");
-   }
-
-   // Calculate TP4 dollar value
-   double tp4Price = StringToDouble(m_edtTP4.Text());
-   if(tp4Price != 0 && m_orderCount >= 4)
-   {
-      double tp4Distance = MathAbs(tp4Price - entryPrice);
-      double tp4Dollar = (tp4Distance / tickSize) * tickValue * lotSize;
-      m_lblTP4Value.Text("$" + DoubleToString(tp4Dollar, 2));
-   }
-   else
-   {
-      m_lblTP4Value.Text("$0.00");
+      ulong pTicket = PositionGetTicket(p);
+      if(pTicket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == symbol &&
+            PositionGetInteger(POSITION_MAGIC) == magicNumber)
+         {
+            double posTP = PositionGetDouble(POSITION_TP);
+            if(posTP > 0 && tpIndex < 4)
+            {
+               tpValues[tpIndex] = posTP;
+               tpIndex++;
+            }
+         }
+      }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Generate magic number for symbol (with symbol-specific range)    |
+//| Generate magic number for symbol (simple counter-based)         |
 //+------------------------------------------------------------------+
 ulong CTradeUtilityDialog::GetMagicNumberForSymbol(string symbol)
 {
-   // Create a hash from the symbol name to get a unique identifier (0-99)
-   int symbolHash = 0;
-   for(int i = 0; i < StringLen(symbol); i++)
+   // Simple approach: Use millisecond timestamp as unique ID
+   // No collision risk within same EA instance
+   return GetTickCount64();
+}
+
+//+------------------------------------------------------------------+
+//| Check if order/position belongs to this EA                      |
+//+------------------------------------------------------------------+
+bool CTradeUtilityDialog::BelongsToThisEA(string comment)
+{
+   return StringFind(comment, "TradeUtility") >= 0;
+}
+
+//+------------------------------------------------------------------+
+//| Check if breakeven is already activated for a setup             |
+//+------------------------------------------------------------------+
+bool CTradeUtilityDialog::IsBreakevenActivated(string symbol, ulong magicNumber)
+{
+   int totalPositions = PositionsTotal();
+
+   for(int p = 0; p < totalPositions; p++)
    {
-      symbolHash += (int)StringGetCharacter(symbol, i);
+      ulong pTicket = PositionGetTicket(p);
+      if(pTicket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == symbol &&
+            PositionGetInteger(POSITION_MAGIC) == magicNumber)
+         {
+            double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double currentSL = PositionGetDouble(POSITION_SL);
+
+            // Check if SL is at or very close to entry (within 1 pip tolerance)
+            if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
+            {
+               return true;
+            }
+         }
+      }
    }
-   symbolHash = symbolHash % 100;  // Limit to 0-99
 
-   // Get current tick count (milliseconds since system start)
-   // This provides much better precision than TimeLocal() (seconds)
-   // allowing multiple setups per second without collision
-   ulong tickCount = GetTickCount64();
+   return false;
+}
 
-   // Combine: First 2 digits = symbol hash, rest = tick count
-   // This ensures different symbols have different magic number ranges
-   // while guaranteeing uniqueness even for rapid consecutive setups
-   // Format: [SymbolHash 00-99][TickCount milliseconds]
-   ulong magicNumber = ((ulong)symbolHash * 100000000000000) + (tickCount % 100000000000000);
-
-   return magicNumber;
+//+------------------------------------------------------------------+
+//| Build CSV line for input parameters                             |
+//+------------------------------------------------------------------+
+string CTradeUtilityDialog::BuildInputCSVLine(string symbol, string riskPercent, string orderType, string entryPrice, string orderCount, string sl, string tp1, string tp2, string tp3, string tp4, string breakeven)
+{
+   string line = symbol + ",";
+   line += riskPercent + ",";
+   line += orderType + ",";
+   line += entryPrice + ",";
+   line += orderCount + ",";
+   line += sl + ",";
+   line += tp1 + ",";
+   line += tp2 + ",";
+   line += tp3 + ",";
+   line += tp4 + ",";
+   line += breakeven;
+   return line;
 }
 
 //+------------------------------------------------------------------+
@@ -894,72 +904,16 @@ void CTradeUtilityDialog::ReconstructSetups()
    for(int s = 0; s < m_setupCount; s++)
    {
       // Collect TP values from ALL orders with this magic number
-      double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
-      int tpIndex = 0;
-
-      // Scan pending orders for TP values
-      for(int j = 0; j < totalOrders; j++)
-      {
-         ulong ticket = OrderGetTicket(j);
-         if(ticket > 0)
-         {
-            if(OrderGetString(ORDER_SYMBOL) == m_tradeSetups[s].symbol &&
-               OrderGetInteger(ORDER_MAGIC) == m_tradeSetups[s].magicNumber)
-            {
-               double orderTP = OrderGetDouble(ORDER_TP);
-               if(orderTP > 0 && tpIndex < 4)
-               {
-                  tpValues[tpIndex] = orderTP;
-                  tpIndex++;
-               }
-            }
-         }
-      }
-
-      // Scan open positions for TP values (for filled orders)
-      for(int p = 0; p < totalPositions; p++)
-      {
-         ulong pTicket = PositionGetTicket(p);
-         if(pTicket > 0)
-         {
-            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
-               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
-            {
-               double posTP = PositionGetDouble(POSITION_TP);
-               if(posTP > 0 && tpIndex < 4)
-               {
-                  tpValues[tpIndex] = posTP;
-                  tpIndex++;
-               }
-            }
-         }
-      }
+      double tpValues[4];
+      CollectTPValues(m_tradeSetups[s].symbol, m_tradeSetups[s].magicNumber, tpValues);
 
       // Update TP values if we found any from orders/positions
       if(tpValues[0] > 0) m_tradeSetups[s].tp1 = tpValues[0];
       if(tpValues[1] > 0) m_tradeSetups[s].tp2 = tpValues[1];
 
-      // Check if breakeven already activated by examining positions
-      for(int p = 0; p < totalPositions; p++)
-      {
-         ulong pTicket = PositionGetTicket(p);
-         if(pTicket > 0)
-         {
-            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
-               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
-            {
-               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-               double currentSL = PositionGetDouble(POSITION_SL);
-
-               // Check if SL is at or very close to entry (within 1 pip tolerance)
-               if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
-               {
-                  m_tradeSetups[s].beActivated = true;
-                  break;
-               }
-            }
-         }
-      }
+      // Check if breakeven already activated
+      if(IsBreakevenActivated(m_tradeSetups[s].symbol, m_tradeSetups[s].magicNumber))
+         m_tradeSetups[s].beActivated = true;
 
       if(tpValues[0] > 0 || tpValues[1] > 0)
       {
@@ -993,12 +947,11 @@ void CTradeUtilityDialog::ReconstructSetups()
       {
          string orderComment = OrderGetString(ORDER_COMMENT);
          ulong orderMagic = OrderGetInteger(ORDER_MAGIC);
-         double orderTP = OrderGetDouble(ORDER_TP);
          string orderSymbol = OrderGetString(ORDER_SYMBOL);
 
          // Check if this is a TradeUtility order by comment
-         if(StringFind(orderComment, "TradeUtility") < 0)
-            continue;  // Not a TradeUtility order
+         if(!BelongsToThisEA(orderComment))
+            continue;
 
          // Check if we already processed this magic number
          bool alreadyProcessed = false;
@@ -1014,26 +967,8 @@ void CTradeUtilityDialog::ReconstructSetups()
          if(!alreadyProcessed)
          {
             // Collect TP values from ALL orders with this magic number
-            double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
-            int tpIndex = 0;
-
-            for(int j = 0; j < totalOrders; j++)
-            {
-               ulong scanTicket = OrderGetTicket(j);
-               if(scanTicket > 0)
-               {
-                  if(OrderGetString(ORDER_SYMBOL) == orderSymbol &&
-                     OrderGetInteger(ORDER_MAGIC) == orderMagic)
-                  {
-                     double orderTP = OrderGetDouble(ORDER_TP);
-                     if(orderTP > 0 && tpIndex < 4)
-                     {
-                        tpValues[tpIndex] = orderTP;
-                        tpIndex++;
-                     }
-                  }
-               }
-            }
+            double tpValues[4];
+            CollectTPValues(orderSymbol, orderMagic, tpValues);
 
             // Create setup using ACTUAL order properties
             TradeSetup newSetup;
@@ -1076,8 +1011,8 @@ void CTradeUtilityDialog::ReconstructSetups()
          ulong posMagic = PositionGetInteger(POSITION_MAGIC);
 
          // Check if this is a TradeUtility position by comment
-         if(StringFind(posComment, "TradeUtility") < 0)
-            continue;  // Not a TradeUtility position
+         if(!BelongsToThisEA(posComment))
+            continue;
 
          // Check if we already processed this magic number
          bool alreadyProcessed = false;
@@ -1093,26 +1028,8 @@ void CTradeUtilityDialog::ReconstructSetups()
          if(!alreadyProcessed)
          {
             // Collect TP values from ALL positions with this magic number
-            double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
-            int tpIndex = 0;
-
-            for(int p = 0; p < totalPositions; p++)
-            {
-               ulong scanTicket = PositionGetTicket(p);
-               if(scanTicket > 0)
-               {
-                  if(PositionGetString(POSITION_SYMBOL) == posSymbol &&
-                     PositionGetInteger(POSITION_MAGIC) == posMagic)
-                  {
-                     double posTP = PositionGetDouble(POSITION_TP);
-                     if(posTP > 0 && tpIndex < 4)
-                     {
-                        tpValues[tpIndex] = posTP;
-                        tpIndex++;
-                     }
-                  }
-               }
-            }
+            double tpValues[4];
+            CollectTPValues(posSymbol, posMagic, tpValues);
 
             // Create setup using ACTUAL position properties
             TradeSetup newSetup;
@@ -1121,30 +1038,7 @@ void CTradeUtilityDialog::ReconstructSetups()
             newSetup.tp1 = tpValues[0];  // Use TP from first position with this magic
             newSetup.tp2 = tpValues[1];  // Use TP from second position with this magic
             newSetup.beMode = "Disabled";  // Default - actual BE mode loaded from CSV if available
-            newSetup.beActivated = false;
-
-            // Check if breakeven already activated by examining positions
-            // If any position with this magic has SL at entry price, it's activated
-            for(int p = 0; p < totalPositions; p++)
-            {
-               ulong pTicket = PositionGetTicket(p);
-               if(pTicket > 0)
-               {
-                  if(PositionGetString(POSITION_SYMBOL) == posSymbol &&
-                     PositionGetInteger(POSITION_MAGIC) == posMagic)
-                  {
-                     double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-                     double currentSL = PositionGetDouble(POSITION_SL);
-
-                     // Check if SL is at or very close to entry (within 1 pip tolerance)
-                     if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
-                     {
-                        newSetup.beActivated = true;
-                        break;
-                     }
-                  }
-               }
-            }
+            newSetup.beActivated = IsBreakevenActivated(posSymbol, posMagic);
 
             ArrayResize(m_tradeSetups, m_setupCount + 1);
             m_tradeSetups[m_setupCount] = newSetup;
@@ -1378,79 +1272,20 @@ void CTradeUtilityDialog::RefreshSetupsFromOrders()
    if(m_setupCount == 0)
       return;
 
-   int totalPositions = PositionsTotal();
-   int totalOrders = OrdersTotal();
-
    // Update each setup with fresh data from orders/positions
    for(int s = 0; s < m_setupCount; s++)
    {
       // Collect TP values from ALL orders with this magic number
-      double tpValues[4] = {0, 0, 0, 0};  // TP1, TP2, TP3, TP4
-      int tpIndex = 0;
-
-      // Scan pending orders for TP values
-      for(int j = 0; j < totalOrders; j++)
-      {
-         ulong ticket = OrderGetTicket(j);
-         if(ticket > 0)
-         {
-            if(OrderGetString(ORDER_SYMBOL) == m_tradeSetups[s].symbol &&
-               OrderGetInteger(ORDER_MAGIC) == m_tradeSetups[s].magicNumber)
-            {
-               double orderTP = OrderGetDouble(ORDER_TP);
-               if(orderTP > 0 && tpIndex < 4)
-               {
-                  tpValues[tpIndex] = orderTP;
-                  tpIndex++;
-               }
-            }
-         }
-      }
-
-      // Scan open positions for TP values (for filled orders)
-      for(int p = 0; p < totalPositions; p++)
-      {
-         ulong pTicket = PositionGetTicket(p);
-         if(pTicket > 0)
-         {
-            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
-               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
-            {
-               double posTP = PositionGetDouble(POSITION_TP);
-               if(posTP > 0 && tpIndex < 4)
-               {
-                  tpValues[tpIndex] = posTP;
-                  tpIndex++;
-               }
-            }
-         }
-      }
+      double tpValues[4];
+      CollectTPValues(m_tradeSetups[s].symbol, m_tradeSetups[s].magicNumber, tpValues);
 
       // Update TP values if we found any from orders/positions
       if(tpValues[0] > 0) m_tradeSetups[s].tp1 = tpValues[0];
       if(tpValues[1] > 0) m_tradeSetups[s].tp2 = tpValues[1];
 
-      // Check if breakeven already activated by examining positions
-      for(int p = 0; p < totalPositions; p++)
-      {
-         ulong pTicket = PositionGetTicket(p);
-         if(pTicket > 0)
-         {
-            if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
-               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
-            {
-               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-               double currentSL = PositionGetDouble(POSITION_SL);
-
-               // Check if SL is at or very close to entry (within 1 pip tolerance)
-               if(currentSL > 0 && MathAbs(currentSL - entryPrice) < 0.0001)
-               {
-                  m_tradeSetups[s].beActivated = true;
-                  break;
-               }
-            }
-         }
-      }
+      // Check if breakeven already activated
+      if(IsBreakevenActivated(m_tradeSetups[s].symbol, m_tradeSetups[s].magicNumber))
+         m_tradeSetups[s].beActivated = true;
    }
 }
 
@@ -1575,8 +1410,8 @@ void CTradeUtilityDialog::ExecuteTrade(bool isBuy)
    newSetup.beMode = m_cmbBreakeven.Select();
    newSetup.beActivated = false;
 
-   // Add to array with reserve capacity for efficiency
-   ArrayResize(m_tradeSetups, m_setupCount + 1, 10);
+   // Add to array
+   ArrayResize(m_tradeSetups, m_setupCount + 1);
    m_tradeSetups[m_setupCount] = newSetup;
    m_setupCount++;
 
@@ -1745,8 +1580,8 @@ void CTradeUtilityDialog::ProcessBreakeven()
                {
                   // Verify this is a TradeUtility position using comment
                   string posComment = PositionGetString(POSITION_COMMENT);
-                  if(StringFind(posComment, "TradeUtility") < 0)
-                     continue;  // Skip if not created by this EA
+                  if(!BelongsToThisEA(posComment))
+                     continue;
 
                   long posType = PositionGetInteger(POSITION_TYPE);
 
@@ -1786,8 +1621,8 @@ void CTradeUtilityDialog::ProcessBreakeven()
                   {
                      // Verify this is a TradeUtility position using comment
                      string posComment = PositionGetString(POSITION_COMMENT);
-                     if(StringFind(posComment, "TradeUtility") < 0)
-                        continue;  // Skip if not created by this EA
+                     if(!BelongsToThisEA(posComment))
+                        continue;
 
                      double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
                      double currentSL = PositionGetDouble(POSITION_SL);
@@ -1948,18 +1783,8 @@ void CTradeUtilityDialog::SaveInputsToDisk()
                if(fieldCount > 0 && fields[0] == m_currentSymbol)
                {
                   // Update this symbol's line with current UI values
-                  string newLine = m_currentSymbol + ",";
-                  newLine += riskPercent + ",";
-                  newLine += orderType + ",";
-                  newLine += entryPrice + ",";
-                  newLine += orderCount + ",";
-                  newLine += sl + ",";
-                  newLine += tp1 + ",";
-                  newLine += tp2 + ",";
-                  newLine += tp3 + ",";
-                  newLine += tp4 + ",";
-                  newLine += breakeven;
-                  
+                  string newLine = BuildInputCSVLine(m_currentSymbol, riskPercent, orderType, entryPrice, orderCount, sl, tp1, tp2, tp3, tp4, breakeven);
+
                   ArrayResize(lines, lineCount + 1);
                   lines[lineCount] = newLine;
                   lineCount++;
@@ -1988,18 +1813,8 @@ void CTradeUtilityDialog::SaveInputsToDisk()
    // If symbol not found, add new line
    if(!symbolFound)
    {
-      string newLine = m_currentSymbol + ",";
-      newLine += riskPercent + ",";
-      newLine += orderType + ",";
-      newLine += entryPrice + ",";
-      newLine += orderCount + ",";
-      newLine += sl + ",";
-      newLine += tp1 + ",";
-      newLine += tp2 + ",";
-      newLine += tp3 + ",";
-      newLine += tp4 + ",";
-      newLine += breakeven;
-      
+      string newLine = BuildInputCSVLine(m_currentSymbol, riskPercent, orderType, entryPrice, orderCount, sl, tp1, tp2, tp3, tp4, breakeven);
+
       ArrayResize(lines, lineCount + 1);
       lines[lineCount] = newLine;
       lineCount++;
@@ -2156,51 +1971,15 @@ void CTradeUtilityDialog::ApplyInputsToUI(string riskPercent, string orderType, 
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::OnTick()
 {
-   // Detect symbol change (ChartEvent-based detection is better, but OnTick is backup)
-   if(_Symbol != m_currentSymbol)
-   {
-      Print("Symbol changed from ", m_currentSymbol, " to ", _Symbol);
-      
-      // Save OLD symbol's inputs if dirty
-      if(m_inputsDirty)
-      {
-         SaveInputsToDisk();
-         m_inputsDirty = false;
-      }
-      
-      // Update to new symbol
-      m_currentSymbol = _Symbol;
-      m_lastBidPrice = 0;  // Reset price tracking for new symbol
-      
-      // Update symbol info
-      UpdateSymbolInfo();
-      
-      // Load saved inputs from disk for new symbol
-      LoadInputsFromDisk();
-      
-      // Update visual feedback
-      UpdateDataStatusLabel();
-      
-      // Recalculate
-      CalculateLotSize();
-      UpdateDollarValues();
-   }
-   
    if(m_isMarketOrder)
    {
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      
-      // Only update UI if price actually changed (avoid redundant calculations)
-      if(MathAbs(bid - m_lastBidPrice) > 0.000001)
-      {
-         m_lastBidPrice = bid;
-         int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-         m_edtEntryPrice.Text(DoubleToString(bid, digits));
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      m_edtEntryPrice.Text(DoubleToString(bid, digits));
 
-         // Recalculate lot size and update dollar values for MARKET orders
-         CalculateLotSize();
-         UpdateDollarValues();
-      }
+      // Recalculate lot size and update dollar values for MARKET orders
+      CalculateLotSize();
+      UpdateDollarValues();
    }
 
    // Process breakeven logic
@@ -2374,13 +2153,39 @@ void OnChartEvent(const int id,
                   const double &dparam,
                   const string &sparam)
 {
-   // Detect symbol change via ChartEvent (more reliable than OnTick polling)
+   // Detect symbol change via ChartEvent
    if(id == CHARTEVENT_CHART_CHANGE)
    {
-      // Trigger OnTick to handle symbol change logic
-      AppWindow.OnTick();
+      // Check if symbol actually changed
+      if(_Symbol != AppWindow.m_currentSymbol)
+      {
+         Print("Symbol changed from ", AppWindow.m_currentSymbol, " to ", _Symbol);
+
+         // Save OLD symbol's inputs if dirty
+         if(AppWindow.m_inputsDirty)
+         {
+            AppWindow.SaveInputsToDisk();
+            AppWindow.m_inputsDirty = false;
+         }
+
+         // Update to new symbol
+         AppWindow.m_currentSymbol = _Symbol;
+
+         // Update symbol info
+         AppWindow.UpdateSymbolInfo();
+
+         // Load saved inputs from disk for new symbol
+         AppWindow.LoadInputsFromDisk();
+
+         // Update visual feedback
+         AppWindow.UpdateDataStatusLabel();
+
+         // Recalculate
+         AppWindow.CalculateLotSize();
+         AppWindow.UpdateDollarValues();
+      }
    }
-   
+
    // Pass events to the panel
    AppWindow.ChartEvent(id, lparam, dparam, sparam);
 }
