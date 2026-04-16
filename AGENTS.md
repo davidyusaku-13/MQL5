@@ -1,101 +1,33 @@
-## Project Overview
+## Verify First
 
-MetaTrader 5 Expert Advisors (EAs) and utilities written in MQL5 for algorithmic FOREX trading. Primary focus on:
+- No repo-local build, lint, test, or CI config found. Verification is manual in MetaEditor / MT5.
+- Compile changed `.mq5` file in MetaEditor (`F7`).
+- For strategy changes, run MT5 Strategy Tester on `XAUUSD` and load `XAUUSD/XAUUSD_Backtest_20190101_to_Present.set`.
+- `XAUUSD/` and `DailyBreakout-RESULT.csv` are tester presets / reports. New `*.csv`, `*.set`, `*.xlsx`, and `*.xml` files are ignored by `.gitignore`.
 
-- Daily range breakout strategies (DailyBreakout.mq5)
-- Multi-trade management with GUI (MultiTradeManager\*.mq5, TradeUtility.mq5)
-- Backtesting against XAUUSD (gold)
+## Repo Map
 
-## Build & Development
+- `DailyBreakout.mq5`: base daily range breakout EA. Range inputs are minutes from midnight; day rollover uses midnight-normalized `datetime`.
+- `DailyBreakout-ENHANCED.mq5`: breakout EA with weekly loss limit and multi-timeframe trend confirmation.
+- `TradeUtility.mq5`: `CAppDialog` trade panel with per-symbol persistence and breakeven tracking.
+- `MultiTradeManager_v3.mq5`: `CAppDialog` multi-order manager with terminal Global Variable persistence.
+- `MultiTradeManager_v2.mq5` and `MultiTradeManager.mq5`: older variants. `MultiTradeManager.mq5` uses raw chart objects, not `CAppDialog`.
 
-**No build system** - MQL5 files compile directly in MetaTrader 5 platform (MetaEditor).
+## Editing Gotchas
 
-**Testing changes:**
+- Preserve order ownership filters. `TradeUtility` identifies its own orders by `"TradeUtility"` in comment text; `MultiTradeManager*` filters by both `Magic_Number` and `Trade_Comment`.
+- Preserve symbol-aware sizing. Current code reads `SYMBOL_VOLUME_MIN/MAX/STEP`, `SYMBOL_DIGITS`, `SYMBOL_TRADE_TICK_VALUE`, and rounds to symbol lot step.
+- In `TradeUtility`, lot size is derived from balance, risk %, SL, and `m_orderCount`; `m_edtLotSize` is read-only by design.
+- In `TradeUtility`, SL/TP inputs are absolute prices, not points. Dollar labels are derived from those prices.
+- `TradeUtility` state is not only UI-local: it reloads from `TradeUtility_Setups.csv`, `TradeUtility_Inputs.csv`, live orders/positions, and symbol-change events. Do not break that reconstruction flow.
+- `TradeUtility` uses both `OnTick()` and a 100ms `OnTimer()`; timer drives price refresh, cleanup, debounced input saves, and periodic setup saves.
+- `MultiTradeManager_v2.mq5` and `_v3.mq5` start custom control IDs at `100` to avoid `CAppDialog` ID collisions.
+- `MultiTradeManager_v3.mq5` persists UI state in terminal Global Variables with `MTMv3_*` keys. Keep keys stable unless migration is intentional.
+- `MultiTradeManager.mq5` prefixes chart object names with `MTM_<Magic_Number>_`; keep prefixing if touching v1 so multiple instances do not collide.
+- `MultiTradeManager*` cache prices / symbol info and throttle count/UI refresh with `COUNT_UPDATE_THRESHOLD` and `GUI_UPDATE_THRESHOLD`. Avoid adding heavy work to every tick outside those guards.
+- `DailyBreakout*` depend on exact midnight normalization (`hour/min/sec = 0`) for day and range resets.
+- `DailyBreakout.mq5` calculates ranges from `PERIOD_M1` bars, then places pending breakout orders after range end. Keep time-window math aligned with M1 history.
 
-1. Open EA in MetaEditor (F4 or right-click → Edit)
-2. Compile (F7)
-3. Run backtest in MT5 Strategy Tester using XAUUSD symbol
-4. Use `XAUUSD/XAUUSD_Backtest_20190101_to_Present.set` for parameter presets
+## Git
 
-## Architecture
-
-### Core EAs
-
-| File                         | Purpose                                                                                                           |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `DailyBreakout.mq5`          | Range breakout strategy - calculates daily high/low during time windows, places pending orders at breakout levels |
-| `DailyBreakout-ENHANCED.mq5` | Extended version with multi-timeframe trend confirmation, weekly loss limits                                      |
-| `TradeUtility.mq5`           | Advanced trade calculator GUI - risk-based sizing, multiple TPs, breakeven tracking, persistent state per symbol  |
-| `MultiTradeManager_v3.mq5`   | Latest multi-order manager with `CMultiTradeDialog : public CAppDialog`                                           |
-
-### Key Technical Patterns
-
-**MQL5 Standard Library:**
-
-```mql5
-#include <Trade\Trade.mqh>           // CTrade for order execution
-#include <Controls\Dialog.mqh>       // CAppDialog for GUI
-#include <Controls\Button.mqh>       // CButton, CEdit, CComboBox, CLabel
-```
-
-**GUI Pattern:**
-
-- Controls inherit from `CAppDialog`
-- Custom control IDs start at 100+ (avoid CAppDialog internal collision)
-- Event handling via `OnEventMouseDown()` / `OnEventMouseUp()`
-
-**Day Reset Pattern:**
-
-```mql5
-MqlDateTime dt;
-TimeCurrent(dt);
-dt.hour = 0; dt.min = 0; dt.sec = 0;
-datetime today = StructToTime(dt);
-if(today != g_current_day) { /*new day logic*/ }
-```
-
-**Symbol Awareness:**
-
-- Auto-calculate lots via `SymbolInfoDouble(SYMBOL_VOLUME_MIN)`
-- Validate with `symbol_min_lot`, `symbol_max_lot`, `symbol_lot_step`
-- Price precision via `SymbolInfoInteger(SYMBOL_DIGITS)`
-
-**Performance Optimization:**
-
-- Cache prices: `last_bid`, `last_ask`, `last_price_update`
-- Update thresholds: `COUNT_UPDATE_THRESHOLD` (1000ms), `GUI_UPDATE_THRESHOLD` (100ms)
-- Pre-cache symbol info: `symbol_point`, `symbol_digits`, `symbol_stops_level`
-
-### Struct-Based Data Organization
-
-- **TradeGroup** (MultiTradeManager): Groups related trades for coordinated SL/TP
-- **TradeSetup** (TradeUtility): Per-symbol config with breakeven mode
-- **SessionTime** (Sessions): Session metadata (start/end times, colors)
-
-## Critical Patterns to Preserve
-
-1. **DateTime precision**: Zero out hour/min/sec when comparing daily milestones
-2. **TP/SL as absolute prices**: Not points - verify fields use `$` currency prefix
-3. **Lot size as derived**: Calculate from risk %, SL, balance - never accept direct user input
-4. **Magic number filtering**: Use `Magic_Number` input to avoid strategy interference
-5. **Order execution**: Wrap in `CTrade` methods (`trade.BuyLimit()`, `trade.Sell()`)
-
-## Commit Guidelines
-
-Follow Conventional Commits format:
-
-```
-<type>(scope): <description>
-```
-
-Types: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `style`, `chore`
-
-Scopes: `DailyBreakout`, `TradeUtility`, `MultiTradeManager`, `ea`, `docs`
-
-Examples:
-
-```
-feat(DailyBreakout): add min/max range size validation
-fix(TradeUtility): correct symbol change detection on TP updates
-refactor(MultiTradeManager): extract breakeven logic to separate function
-```
+- Recent history uses Conventional Commits: `type(scope): subject`.
