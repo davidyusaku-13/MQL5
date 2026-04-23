@@ -124,6 +124,7 @@ public:
    void              UpdateSymbolInfo();
    void              CalculateLotSize();
    void              UpdateDollarValues();
+   string            FormatVolume(double volume);
 
 protected:
    virtual bool      CreateControls();
@@ -133,6 +134,7 @@ protected:
    bool              IsBreakevenActivated(string symbol, ulong magicNumber);
    string            BuildInputCSVLine(string symbol, string riskPercent, string orderType, string entryPrice, string orderCount, string sl, string tp1, string tp2, string tp3, string tp4, string breakeven);
    bool              BelongsToThisEA(string comment);
+   bool              IsTrackedTrade(string symbol, ulong magicNumber, string comment);
    virtual void      OnChangeOrderType();
    virtual void      OnChangeOrderCount();
    void              UpdateButtonLabels();
@@ -144,6 +146,7 @@ protected:
    void              OnClickCloseAll();
    void              ProcessBreakeven();
    bool              ValidatePendingPrice(bool isBuy, double entryPrice);
+   double            GetMarketEntryPrice(bool isBuy);
    double            GetMinLot();
    ulong             GetMagicNumberForSymbol(string symbol);
    void              SetComboBoxFontSize(CComboBox &combobox, int fontSize);
@@ -545,7 +548,7 @@ void CTradeUtilityDialog::UpdateSymbolInfo()
    m_edtSymbol.Text(symbol);
 
    double minLot = GetMinLot();
-   m_edtMinLot.Text(DoubleToString(minLot, 2));
+   m_edtMinLot.Text(FormatVolume(minLot));
 }
 
 //+------------------------------------------------------------------+
@@ -554,6 +557,34 @@ void CTradeUtilityDialog::UpdateSymbolInfo()
 double CTradeUtilityDialog::GetMinLot()
 {
    return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+}
+
+//+------------------------------------------------------------------+
+//| Format volume using symbol lot step precision                    |
+//+------------------------------------------------------------------+
+string CTradeUtilityDialog::FormatVolume(double volume)
+{
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   int volumeDigits = 0;
+
+   if(lotStep > 0)
+   {
+      string stepText = DoubleToString(lotStep, 8);
+      int dotPos = StringFind(stepText, ".");
+
+      if(dotPos >= 0)
+      {
+         int lastNonZero = StringLen(stepText) - 1;
+         while(lastNonZero > dotPos && StringGetCharacter(stepText, lastNonZero) == '0')
+            lastNonZero--;
+
+         volumeDigits = lastNonZero - dotPos;
+         if(volumeDigits < 0)
+            volumeDigits = 0;
+      }
+   }
+
+   return DoubleToString(volume, volumeDigits);
 }
 
 //+------------------------------------------------------------------+
@@ -719,7 +750,7 @@ void CTradeUtilityDialog::CalculateLotSize()
    if(lotSize < minLot) lotSize = minLot;
    if(lotSize > maxLot) lotSize = maxLot;
 
-   m_edtLotSize.Text(DoubleToString(lotSize, 2));
+   m_edtLotSize.Text(FormatVolume(lotSize));
 }
 
 //+------------------------------------------------------------------+
@@ -782,8 +813,10 @@ void CTradeUtilityDialog::CollectTPValues(string symbol, ulong magicNumber, doub
       ulong ticket = OrderGetTicket(j);
       if(ticket > 0)
       {
+         string orderComment = OrderGetString(ORDER_COMMENT);
          if(OrderGetString(ORDER_SYMBOL) == symbol &&
-            OrderGetInteger(ORDER_MAGIC) == magicNumber)
+            OrderGetInteger(ORDER_MAGIC) == magicNumber &&
+            BelongsToThisEA(orderComment))
          {
             double orderTP = OrderGetDouble(ORDER_TP);
             if(orderTP > 0 && tpIndex < 4)
@@ -801,8 +834,10 @@ void CTradeUtilityDialog::CollectTPValues(string symbol, ulong magicNumber, doub
       ulong pTicket = PositionGetTicket(p);
       if(pTicket > 0)
       {
+         string posComment = PositionGetString(POSITION_COMMENT);
          if(PositionGetString(POSITION_SYMBOL) == symbol &&
-            PositionGetInteger(POSITION_MAGIC) == magicNumber)
+            PositionGetInteger(POSITION_MAGIC) == magicNumber &&
+            BelongsToThisEA(posComment))
          {
             double posTP = PositionGetDouble(POSITION_TP);
             if(posTP > 0 && tpIndex < 4)
@@ -834,6 +869,26 @@ bool CTradeUtilityDialog::BelongsToThisEA(string comment)
 }
 
 //+------------------------------------------------------------------+
+//| Check if trade belongs to this EA and tracked setup             |
+//+------------------------------------------------------------------+
+bool CTradeUtilityDialog::IsTrackedTrade(string symbol, ulong magicNumber, string comment)
+{
+   if(!BelongsToThisEA(comment))
+      return false;
+
+   for(int i = 0; i < m_setupCount; i++)
+   {
+      if(m_tradeSetups[i].symbol == symbol &&
+         m_tradeSetups[i].magicNumber == magicNumber)
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
 //| Check if breakeven is already activated for a setup             |
 //+------------------------------------------------------------------+
 bool CTradeUtilityDialog::IsBreakevenActivated(string symbol, ulong magicNumber)
@@ -845,8 +900,10 @@ bool CTradeUtilityDialog::IsBreakevenActivated(string symbol, ulong magicNumber)
       ulong pTicket = PositionGetTicket(p);
       if(pTicket > 0)
       {
+         string posComment = PositionGetString(POSITION_COMMENT);
          if(PositionGetString(POSITION_SYMBOL) == symbol &&
-            PositionGetInteger(POSITION_MAGIC) == magicNumber)
+            PositionGetInteger(POSITION_MAGIC) == magicNumber &&
+            BelongsToThisEA(posComment))
          {
             double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
             double currentSL = PositionGetDouble(POSITION_SL);
@@ -1099,8 +1156,10 @@ void CTradeUtilityDialog::CleanupCompletedSetups()
          ulong ticket = OrderGetTicket(i);
          if(ticket > 0)
          {
+            string orderComment = OrderGetString(ORDER_COMMENT);
             if(OrderGetString(ORDER_SYMBOL) == m_tradeSetups[s].symbol &&
-               OrderGetInteger(ORDER_MAGIC) == m_tradeSetups[s].magicNumber)
+               OrderGetInteger(ORDER_MAGIC) == m_tradeSetups[s].magicNumber &&
+               BelongsToThisEA(orderComment))
             {
                hasOrders = true;
                break;
@@ -1114,8 +1173,10 @@ void CTradeUtilityDialog::CleanupCompletedSetups()
          ulong ticket = PositionGetTicket(i);
          if(ticket > 0)
          {
+            string posComment = PositionGetString(POSITION_COMMENT);
             if(PositionGetString(POSITION_SYMBOL) == m_tradeSetups[s].symbol &&
-               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber)
+               PositionGetInteger(POSITION_MAGIC) == m_tradeSetups[s].magicNumber &&
+               BelongsToThisEA(posComment))
             {
                hasPositions = true;
                break;
@@ -1345,6 +1406,15 @@ bool CTradeUtilityDialog::ValidatePendingPrice(bool isBuy, double entryPrice)
 }
 
 //+------------------------------------------------------------------+
+//| Get live market entry price for requested side                   |
+//+------------------------------------------------------------------+
+double CTradeUtilityDialog::GetMarketEntryPrice(bool isBuy)
+{
+   return isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+}
+
+//+------------------------------------------------------------------+
 //| Handle BUY button click                                          |
 //+------------------------------------------------------------------+
 void CTradeUtilityDialog::OnClickBuy()
@@ -1370,13 +1440,23 @@ void CTradeUtilityDialog::ExecuteTrade(bool isBuy)
 
    // Get trade parameters
    double entryPrice = StringToDouble(m_edtEntryPrice.Text());
-   double lotSize = StringToDouble(m_edtLotSize.Text());
    double slPrice = StringToDouble(m_edtSL.Text());
    double tpPrices[4];
    tpPrices[0] = StringToDouble(m_edtTP1.Text());
    tpPrices[1] = StringToDouble(m_edtTP2.Text());
    tpPrices[2] = StringToDouble(m_edtTP3.Text());
    tpPrices[3] = StringToDouble(m_edtTP4.Text());
+
+   if(m_isMarketOrder)
+   {
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      entryPrice = GetMarketEntryPrice(isBuy);
+      m_edtEntryPrice.Text(DoubleToString(entryPrice, digits));
+      CalculateLotSize();
+      UpdateDollarValues();
+   }
+
+   double lotSize = StringToDouble(m_edtLotSize.Text());
 
    // Validate lot size
    if(lotSize <= 0)
@@ -1465,8 +1545,10 @@ void CTradeUtilityDialog::OnClickCancelAll()
       ulong ticket = OrderGetTicket(i);
       if(ticket > 0)
       {
+         string orderComment = OrderGetString(ORDER_COMMENT);
          // Check if order is for current symbol
-         if(OrderGetString(ORDER_SYMBOL) == _Symbol)
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+            IsTrackedTrade(_Symbol, OrderGetInteger(ORDER_MAGIC), orderComment))
          {
             if(trade.OrderDelete(ticket))
             {
@@ -1506,8 +1588,10 @@ void CTradeUtilityDialog::OnClickCloseAll()
       ulong ticket = PositionGetTicket(i);
       if(ticket > 0)
       {
+         string posComment = PositionGetString(POSITION_COMMENT);
          // Check if position is for current symbol
-         if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            IsTrackedTrade(_Symbol, PositionGetInteger(POSITION_MAGIC), posComment))
          {
             if(trade.PositionClose(ticket))
             {
