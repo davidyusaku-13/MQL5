@@ -12,7 +12,7 @@ CTrade trade;
 
 // Input Parameters
 input int      magic_number = 12345;       // Magic Number
-input bool     autolot = true;            // Use autolot based on balance
+input bool     autolot = false;            // Use autolot based on balance
 input double   base_balance = 100.0;      // Base balance for lot calculation
 input double   lot = 0.01;                  // Lot size for each base_balance unit
 input double   min_lot = 0.01;             // Minimum lot size
@@ -24,7 +24,7 @@ input int      range_duration = 270;       // Range duration in minutes
 input int      range_close_time = 1200;    // Range close time in minutes (-1=off)
 input string   breakout_mode = "one breakout per range"; // Breakout Mode
 input bool     range_on_monday = true;     // Range on Monday
-input bool     range_on_tuesday = false;    // Range on Tuesday
+input bool     range_on_tuesday = true;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
 input bool     range_on_thursday = true;   // Range on Thursday
 input bool     range_on_friday = true;     // Range on Friday
@@ -58,6 +58,138 @@ double g_max_range_ever = 0;    // Track maximum range seen
 double g_min_range_ever = 999999; // Track minimum range seen
 datetime g_max_range_date = 0;  // Date of maximum range 
 datetime g_min_range_date = 0;  // Date of minimum range
+
+//+------------------------------------------------------------------+
+//| Check if close time has passed for current day                    |
+//+------------------------------------------------------------------+
+bool IsAfterCloseTime()
+{
+   return (g_close_time > 0 && TimeCurrent() >= g_close_time);
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has open buy exposure                                 |
+//+------------------------------------------------------------------+
+bool HasBuyExposure()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if(position_ticket > 0)
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == magic_number &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         {
+            return true;
+         }
+      }
+   }
+
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket > 0)
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == magic_number &&
+            OrderGetString(ORDER_SYMBOL) == _Symbol &&
+            OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_BUY_STOP)
+         {
+            return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has open buy position                                 |
+//+------------------------------------------------------------------+
+bool HasBuyPosition()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if(position_ticket > 0)
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == magic_number &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         {
+            return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has open sell exposure                                |
+//+------------------------------------------------------------------+
+bool HasSellExposure()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if(position_ticket > 0)
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == magic_number &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         {
+            return true;
+         }
+      }
+   }
+
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket > 0)
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == magic_number &&
+            OrderGetString(ORDER_SYMBOL) == _Symbol &&
+            OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_STOP)
+         {
+            return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has open sell position                                |
+//+------------------------------------------------------------------+
+bool HasSellPosition()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if(position_ticket > 0)
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == magic_number &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         {
+            return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has any open positions or pending orders              |
+//+------------------------------------------------------------------+
+bool HasActiveExposure()
+{
+   return (HasBuyExposure() || HasSellExposure());
+}
 
 
 //+------------------------------------------------------------------+
@@ -146,7 +278,6 @@ void OnTick()
    if(!g_orders_placed && TimeCurrent() >= g_range_end_time)
    {
       PlacePendingOrders();
-      return;
    }
    
    // Apply trailing stop to open positions if enabled
@@ -156,7 +287,7 @@ void OnTick()
    }
    
    // Check if we should close all orders
-   if(g_orders_placed && range_close_time > 0 && TimeCurrent() >= g_close_time)
+   if(range_close_time > 0 && TimeCurrent() >= g_close_time && HasActiveExposure())
    {
       CloseAllOrders();
       return;
@@ -224,25 +355,21 @@ void CalculateDailyRange()
    g_high_price = 0;
    g_low_price = 99999999;
    
-   int bars_to_check = range_duration / PeriodSeconds(PERIOD_M1) * 60;
-   if(bars_to_check > Bars(_Symbol, PERIOD_M1))
-      bars_to_check = Bars(_Symbol, PERIOD_M1);
-   
-   for(int i = 0; i < bars_to_check; i++)
+   MqlRates rates[];
+   int bars_copied = CopyRates(_Symbol, PERIOD_M1, g_range_start_time, g_range_end_time, rates);
+   if(bars_copied <= 0)
    {
-      datetime bar_time = iTime(_Symbol, PERIOD_M1, i);
-      
-      // Check if the bar is within our range time
-      if(bar_time >= g_range_start_time && bar_time <= g_range_end_time)
-      {
-         double bar_high = iHigh(_Symbol, PERIOD_M1, i);
-         if(bar_high > g_high_price)
-            g_high_price = bar_high;
-            
-         double bar_low = iLow(_Symbol, PERIOD_M1, i);
-         if(bar_low < g_low_price)
-            g_low_price = bar_low;
-      }
+      Print("No M1 bars found for range window: ", TimeToString(g_range_start_time), " - ", TimeToString(g_range_end_time));
+      return;
+   }
+
+   for(int i = 0; i < bars_copied; i++)
+   {
+      if(rates[i].high > g_high_price)
+         g_high_price = rates[i].high;
+
+      if(rates[i].low < g_low_price)
+         g_low_price = rates[i].low;
    }
    
    // Mark range as calculated
@@ -311,6 +438,12 @@ void PlacePendingOrders()
 {
    if(g_high_price <= 0 || g_low_price >= 99999999)
       return;
+
+   if(IsAfterCloseTime())
+   {
+      g_orders_placed = true;
+      return;
+   }
       
    double range_size = g_high_price - g_low_price;
    double range_points = range_size / _Point;
@@ -340,6 +473,22 @@ void PlacePendingOrders()
    
    
    g_lot_size = CalculateLotSize(range_size);
+
+   if(StringCompare(breakout_mode, "one breakout per range") == 0 &&
+      (HasBuyPosition() || HasSellPosition()))
+   {
+      g_orders_placed = true;
+      return;
+   }
+
+   bool need_buy = !HasBuyExposure();
+   bool need_sell = !HasSellExposure();
+
+   if(!need_buy && !need_sell)
+   {
+      g_orders_placed = true;
+      return;
+   }
    
    // Calculate SL and TP
    double buy_sl = 0, buy_tp = 0, sell_sl = 0, sell_tp = 0;
@@ -360,50 +509,58 @@ void PlacePendingOrders()
    // Place buy stop order at the high of the range
    trade.SetExpertMagicNumber(magic_number);
    
-   bool buy_success = trade.BuyStop(
-      g_lot_size,
-      g_high_price,
-      _Symbol,
-      buy_sl,
-      buy_tp,
-      ORDER_TIME_DAY,
-      0,
-      "Range Breakout Buy"
-   );
-   
-   if(buy_success)
+   bool buy_success = !need_buy;
+   if(need_buy)
    {
-      g_buy_ticket = trade.ResultOrder();
-      Print("Buy Stop order placed at ", g_high_price, " with lot size ", g_lot_size);
-   }
-   else
-   {
-      Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      buy_success = trade.BuyStop(
+         g_lot_size,
+         g_high_price,
+         _Symbol,
+         buy_sl,
+         buy_tp,
+         ORDER_TIME_DAY,
+         0,
+         "Range Breakout Buy"
+      );
+
+      if(buy_success)
+      {
+         g_buy_ticket = trade.ResultOrder();
+         Print("Buy Stop order placed at ", g_high_price, " with lot size ", g_lot_size);
+      }
+      else
+      {
+         Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      }
    }
    
    // Place sell stop order at the low of the range
-   bool sell_success = trade.SellStop(
-      g_lot_size,
-      g_low_price,
-      _Symbol,
-      sell_sl,
-      sell_tp,
-      ORDER_TIME_DAY,
-      0,
-      "Range Breakout Sell"
-   );
-   
-   if(sell_success)
+   bool sell_success = !need_sell;
+   if(need_sell)
    {
-      g_sell_ticket = trade.ResultOrder();
-      Print("Sell Stop order placed at ", g_low_price, " with lot size ", g_lot_size);
-   }
-   else
-   {
-      Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      sell_success = trade.SellStop(
+         g_lot_size,
+         g_low_price,
+         _Symbol,
+         sell_sl,
+         sell_tp,
+         ORDER_TIME_DAY,
+         0,
+         "Range Breakout Sell"
+      );
+
+      if(sell_success)
+      {
+         g_sell_ticket = trade.ResultOrder();
+         Print("Sell Stop order placed at ", g_low_price, " with lot size ", g_lot_size);
+      }
+      else
+      {
+         Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      }
    }
    
-   g_orders_placed = true;
+   g_orders_placed = buy_success && sell_success;
 }
 
 //+------------------------------------------------------------------+
@@ -528,9 +685,8 @@ void CloseAllOrders()
       }
    }
    
-   // Reset flags for next day
-   g_range_calculated = false;
-   g_orders_placed = false;
+   // Keep day marked as processed after close time; daily rollover resets state.
+   g_orders_placed = true;
    g_buy_ticket = 0;
    g_sell_ticket = 0;
 }

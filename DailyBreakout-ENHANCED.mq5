@@ -16,7 +16,7 @@ input int range_duration = 270;                        // Range duration in minu
 input int range_close_time = 1200;                     // Range close time in minutes (-1=off)
 input string breakout_mode = "one breakout per range"; // Breakout Mode
 input bool range_on_monday = true;                     // Range on Monday
-input bool range_on_tuesday = false;                   // Range on Tuesday
+input bool range_on_tuesday = true;                   // Range on Tuesday
 input bool range_on_wednesday = true;                  // Range on Wednesday
 input bool range_on_thursday = true;                   // Range on Thursday
 input bool range_on_friday = true;                     // Range on Friday
@@ -128,6 +128,77 @@ bool g_one_breakout_mode = false;
 const string LINE_START = "Range_Start_Line";
 const string LINE_END   = "Range_End_Line";
 const string LINE_CLOSE = "Range_Close_Line";
+
+bool PositionBelongsToEA(ulong ticket);
+bool OrderBelongsToEA(ulong ticket);
+
+//+------------------------------------------------------------------+
+//| Check if close time has passed for current day                    |
+//+------------------------------------------------------------------+
+bool IsAfterCloseTime()
+{
+   return (g_range.close_time > 0 && TimeCurrent() >= g_range.close_time);
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has open exposure in specified direction              |
+//+------------------------------------------------------------------+
+bool HasPositionExposure(ENUM_POSITION_TYPE position_type)
+{
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong position_ticket = PositionGetTicket(i);
+      if (position_ticket > 0 && PositionBelongsToEA(position_ticket))
+      {
+         if (PositionGetInteger(POSITION_TYPE) == position_type)
+            return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has pending exposure in specified direction           |
+//+------------------------------------------------------------------+
+bool HasPendingExposure(ENUM_ORDER_TYPE order_type)
+{
+   for (int i = 0; i < OrdersTotal(); i++)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if (order_ticket > 0 && OrderBelongsToEA(order_ticket))
+      {
+         if (OrderGetInteger(ORDER_TYPE) == order_type)
+            return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has buy exposure                                      |
+//+------------------------------------------------------------------+
+bool HasBuyExposure()
+{
+   return (HasPositionExposure(POSITION_TYPE_BUY) || HasPendingExposure(ORDER_TYPE_BUY_STOP));
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has sell exposure                                     |
+//+------------------------------------------------------------------+
+bool HasSellExposure()
+{
+   return (HasPositionExposure(POSITION_TYPE_SELL) || HasPendingExposure(ORDER_TYPE_SELL_STOP));
+}
+
+//+------------------------------------------------------------------+
+//| Check if EA has any open positions or pending orders              |
+//+------------------------------------------------------------------+
+bool HasActiveExposure()
+{
+   return (HasBuyExposure() || HasSellExposure());
+}
 
 //+------------------------------------------------------------------+
 //| Get today's date at midnight (00:00:00)                         |
@@ -345,13 +416,6 @@ void OnTick()
       CheckWeeklyReset();
    }
 
-   // Check if weekly loss limit reached (only affects new order placement)
-   if (g_weekly.limit_reached && !g_order.orders_placed)
-   {
-      // Weekly limit reached - don't place new orders
-      return;
-   }
-
    // Check if it's a valid trading day
    if (!IsTradingDay())
       return;
@@ -374,7 +438,6 @@ void OnTick()
    if (!g_order.orders_placed && TimeCurrent() >= g_range.end_time)
    {
       PlacePendingOrders();
-      return;
    }
 
    // Apply trailing stop to open positions if enabled
@@ -384,7 +447,7 @@ void OnTick()
    }
 
    // Check if we should close all orders
-   if (g_order.orders_placed && range_close_time > 0 && TimeCurrent() >= g_range.close_time)
+   if (range_close_time > 0 && TimeCurrent() >= g_range.close_time && HasActiveExposure())
    {
       CloseAllOrders();
       return;
@@ -644,17 +707,18 @@ void CountSwingPoints(const double &highs[], const double &lows[],
 //+------------------------------------------------------------------+
 //| Get recent momentum direction                                    |
 //+------------------------------------------------------------------+
-bool GetRecentMomentum(ENUM_TIMEFRAMES timeframe)
+bool GetRecentMomentum(ENUM_TIMEFRAMES timeframe, bool &momentum_available)
 {
+   momentum_available = false;
    double current_price = (g_price.bid + g_price.ask) / 2;
-   double old_price = 0;
 
    double closes[];
    ArraySetAsSeries(closes, true);
-   if (CopyClose(_Symbol, timeframe, trend_momentum_period, 1, closes) > 0)
-      old_price = closes[0];
+   if (CopyClose(_Symbol, timeframe, trend_momentum_period, 1, closes) != 1)
+      return false;
 
-   return (current_price > old_price);
+   momentum_available = true;
+   return (current_price > closes[0]);
 }
 
 //+------------------------------------------------------------------+
@@ -689,7 +753,10 @@ int DetectTrendBySwings(ENUM_TIMEFRAMES timeframe)
    CountSwingPoints(highs, lows, higher_highs, lower_highs, higher_lows, lower_lows);
 
    // Get recent momentum
-   bool recent_upward_momentum = GetRecentMomentum(timeframe);
+   bool momentum_available = false;
+   bool recent_upward_momentum = GetRecentMomentum(timeframe, momentum_available);
+   if (!momentum_available)
+      return 0;
 
    // Determine trend based on swing analysis and momentum
    bool strong_uptrend = (higher_highs > lower_highs && higher_lows > lower_lows && recent_upward_momentum);
@@ -759,11 +826,6 @@ void GetTrendConfirmation(bool &bullish_confirmed, bool &bearish_confirmed)
       }
       else // Neutral
       {
-         if (!require_all_timeframes)
-         {
-            bullish_agreeing++;
-            bearish_agreeing++;
-         }
          Print(timeframe_names[i], " is neutral");
       }
    }
@@ -913,29 +975,21 @@ void CalculateDailyRange()
    g_range.high_price = 0;
    g_range.low_price = 99999999;
 
-   int bars_to_check = range_duration / PeriodSeconds(PERIOD_M1) * 60;
-   if (bars_to_check > Bars(_Symbol, PERIOD_M1))
-      bars_to_check = Bars(_Symbol, PERIOD_M1);
-
-   for (int i = 0; i < bars_to_check; i++)
+   MqlRates rates[];
+   int bars_copied = CopyRates(_Symbol, PERIOD_M1, g_range.start_time, g_range.end_time, rates);
+   if (bars_copied <= 0)
    {
-      datetime bar_time = iTime(_Symbol, PERIOD_M1, i);
+      Print("No M1 bars found for range window: ", TimeToString(g_range.start_time), " - ", TimeToString(g_range.end_time));
+      return;
+   }
 
-      // Early exit: bars are ordered newest to oldest, so if we've passed the range start, no more matches
-      if (bar_time < g_range.start_time)
-         break;
+   for (int i = 0; i < bars_copied; i++)
+   {
+      if (rates[i].high > g_range.high_price)
+         g_range.high_price = rates[i].high;
 
-      // Check if the bar is within our range time
-      if (bar_time >= g_range.start_time && bar_time <= g_range.end_time)
-      {
-         double bar_high = iHigh(_Symbol, PERIOD_M1, i);
-         if (bar_high > g_range.high_price)
-            g_range.high_price = bar_high;
-
-         double bar_low = iLow(_Symbol, PERIOD_M1, i);
-         if (bar_low < g_range.low_price)
-            g_range.low_price = bar_low;
-      }
+      if (rates[i].low < g_range.low_price)
+         g_range.low_price = rates[i].low;
    }
 
    // Mark range as calculated
@@ -1036,11 +1090,20 @@ void PlacePendingOrders()
    if (g_range.high_price <= 0 || g_range.low_price >= 99999999)
       return;
 
+   if (max_weekly_loss_pct > 0)
+      CheckWeeklyLossLimit();
+
    // Check weekly loss limit before placing orders
    if (max_weekly_loss_pct > 0 && g_weekly.limit_reached)
    {
       Print("Weekly loss limit reached - no new orders will be placed until next week");
       g_order.orders_placed = true; // Mark as processed so we don't try again today
+      return;
+   }
+
+   if (IsAfterCloseTime())
+   {
+      g_order.orders_placed = true;
       return;
    }
 
@@ -1095,6 +1158,22 @@ void PlacePendingOrders()
 
    g_order.lot_size = CalculateLotSize(range_size);
 
+   if (g_one_breakout_mode &&
+       (HasPositionExposure(POSITION_TYPE_BUY) || HasPositionExposure(POSITION_TYPE_SELL)))
+   {
+      g_order.orders_placed = true;
+      return;
+   }
+
+   bool need_buy = (!enable_trend_confirmation || bullish_trend_confirmed) && !HasBuyExposure();
+   bool need_sell = (!enable_trend_confirmation || bearish_trend_confirmed) && !HasSellExposure();
+
+   if (!need_buy && !need_sell)
+   {
+      g_order.orders_placed = true;
+      return;
+   }
+
    // Calculate SL and TP
    double buy_sl = 0, buy_tp = 0, sell_sl = 0, sell_tp = 0;
 
@@ -1103,6 +1182,11 @@ void PlacePendingOrders()
       // Calculate SL based on range percentage
       buy_sl = g_range.high_price - (range_size * stop_loss / 100);
       sell_sl = g_range.low_price + (range_size * stop_loss / 100);
+   }
+   else
+   {
+      buy_sl = g_range.low_price;
+      sell_sl = g_range.high_price;
    }
 
    if (take_profit > 0)
@@ -1115,9 +1199,10 @@ void PlacePendingOrders()
    trade.SetExpertMagicNumber(magic_number);
 
    // Place buy stop order at the high of the range only if bullish trend is confirmed
-   if (!enable_trend_confirmation || bullish_trend_confirmed)
+   bool buy_success = !need_buy;
+   if (need_buy)
    {
-      bool buy_success = trade.BuyStop(
+      buy_success = trade.BuyStop(
           g_order.lot_size,
           g_range.high_price,
           _Symbol,
@@ -1137,15 +1222,16 @@ void PlacePendingOrders()
          Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
       }
    }
-   else
+   else if (enable_trend_confirmation && !bullish_trend_confirmed)
    {
       Print("✗ Buy Stop order SKIPPED - bullish trend not confirmed");
    }
 
    // Place sell stop order at the low of the range only if bearish trend is confirmed
-   if (!enable_trend_confirmation || bearish_trend_confirmed)
+   bool sell_success = !need_sell;
+   if (need_sell)
    {
-      bool sell_success = trade.SellStop(
+      sell_success = trade.SellStop(
           g_order.lot_size,
           g_range.low_price,
           _Symbol,
@@ -1165,12 +1251,12 @@ void PlacePendingOrders()
          Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
       }
    }
-   else
+   else if (enable_trend_confirmation && !bearish_trend_confirmed)
    {
       Print("✗ Sell Stop order SKIPPED - bearish trend not confirmed");
    }
 
-   g_order.orders_placed = true;
+   g_order.orders_placed = buy_success && sell_success;
 }
 
 //+------------------------------------------------------------------+
@@ -1258,9 +1344,8 @@ void CloseAllOrders()
       }
    }
 
-   // Reset flags for next day
-   g_range.calculated = false;
-   g_order.orders_placed = false;
+   // Keep day marked as processed after close time; daily rollover resets state.
+   g_order.orders_placed = true;
    g_order.buy_ticket = 0;
    g_order.sell_ticket = 0;
 }
