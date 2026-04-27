@@ -191,12 +191,218 @@ bool HasActiveExposure()
    return (HasBuyExposure() || HasSellExposure());
 }
 
+//+------------------------------------------------------------------+
+//| Check if one-breakout mode is enabled                             |
+//+------------------------------------------------------------------+
+bool IsOneBreakoutMode()
+{
+   return (StringCompare(breakout_mode, "one breakout per range") == 0);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize price to symbol digits                                  |
+//+------------------------------------------------------------------+
+double NormalizePrice(double price)
+{
+   if(price <= 0)
+      return 0;
+
+   return NormalizeDouble(price, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| Get decimal precision needed for lot step                         |
+//+------------------------------------------------------------------+
+int GetLotDigits(double lot_step)
+{
+   if(lot_step <= 0)
+      return 2;
+
+   int digits = 0;
+   double step = lot_step;
+
+   while(digits < 8 && MathAbs(step - MathRound(step)) > 0.00000001)
+   {
+      step *= 10.0;
+      digits++;
+   }
+
+   return digits;
+}
+
+//+------------------------------------------------------------------+
+//| Clamp and normalize lot size to input and symbol limits            |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(double requested_lot)
+{
+   double symbol_min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double symbol_max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(symbol_min_lot <= 0 || symbol_max_lot <= 0 || lot_step <= 0)
+   {
+      Print("Invalid symbol volume settings. Min: ", symbol_min_lot,
+            ", Max: ", symbol_max_lot, ", Step: ", lot_step);
+      return 0;
+   }
+
+   double effective_min_lot = MathMax(min_lot, symbol_min_lot);
+   double effective_max_lot = MathMin(max_lot, symbol_max_lot);
+
+   if(effective_min_lot > effective_max_lot)
+   {
+      Print("Lot limits invalid for symbol. Input min/max: ", min_lot, "/", max_lot,
+            ", Symbol min/max: ", symbol_min_lot, "/", symbol_max_lot);
+      return 0;
+   }
+
+   double lot_size = requested_lot;
+   if(lot_size < effective_min_lot)
+      lot_size = effective_min_lot;
+   else if(lot_size > effective_max_lot)
+      lot_size = effective_max_lot;
+
+   lot_size = MathFloor(lot_size / lot_step) * lot_step;
+   if(lot_size < effective_min_lot)
+      lot_size = effective_min_lot;
+
+   return NormalizeDouble(lot_size, GetLotDigits(lot_step));
+}
+
+//+------------------------------------------------------------------+
+//| Validate EA inputs                                                 |
+//+------------------------------------------------------------------+
+bool ValidateInputs()
+{
+   if(autolot && base_balance <= 0)
+   {
+      Print("Invalid input: base_balance must be > 0 when autolot is enabled.");
+      return false;
+   }
+
+   if(lot <= 0 || min_lot <= 0 || max_lot <= 0 || min_lot > max_lot)
+   {
+      Print("Invalid lot inputs. lot/min_lot/max_lot must be positive and min_lot <= max_lot.");
+      return false;
+   }
+
+   if(range_start_time < 0 || range_start_time >= 1440 || range_duration <= 0)
+   {
+      Print("Invalid range inputs. range_start_time must be 0..1439 and range_duration must be > 0.");
+      return false;
+   }
+
+   if(stop_loss < 0 || take_profit < 0 || trailing_stop < 0 || trailing_start < 0)
+   {
+      Print("Invalid risk inputs. stop_loss, take_profit, trailing_stop, and trailing_start cannot be negative.");
+      return false;
+   }
+
+   if(max_range_size < 0 || min_range_size < 0 || (max_range_size > 0 && min_range_size > max_range_size))
+   {
+      Print("Invalid range size filters. min_range_size/max_range_size must be non-negative and min <= max.");
+      return false;
+   }
+
+   if(NormalizeLotSize(lot) <= 0)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Validate pending order price against current price and stop level  |
+//+------------------------------------------------------------------+
+bool ValidatePendingPrice(ENUM_ORDER_TYPE order_type, double price)
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int stop_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double min_distance = stop_level * _Point;
+
+   if(bid <= 0 || ask <= 0)
+   {
+      Print("Invalid Bid/Ask. Bid: ", bid, ", Ask: ", ask);
+      return false;
+   }
+
+   if(order_type == ORDER_TYPE_BUY_STOP && price <= ask + min_distance)
+   {
+      Print("Buy Stop price too close or already passed. Price: ", price,
+            ", Ask: ", ask, ", Min distance points: ", stop_level);
+      return false;
+   }
+
+   if(order_type == ORDER_TYPE_SELL_STOP && price >= bid - min_distance)
+   {
+      Print("Sell Stop price too close or already passed. Price: ", price,
+            ", Bid: ", bid, ", Min distance points: ", stop_level);
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Delete pending orders by type                                      |
+//+------------------------------------------------------------------+
+bool DeletePendingOrdersByType(ENUM_ORDER_TYPE order_type)
+{
+   bool all_deleted = true;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket <= 0)
+         continue;
+
+      if(OrderGetInteger(ORDER_MAGIC) != magic_number ||
+         OrderGetString(ORDER_SYMBOL) != _Symbol ||
+         OrderGetInteger(ORDER_TYPE) != order_type)
+      {
+         continue;
+      }
+
+      if(!trade.OrderDelete(order_ticket))
+      {
+         all_deleted = false;
+         Print("Failed to delete pending order #", order_ticket, ". Error: ",
+               trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+      }
+   }
+
+   return all_deleted;
+}
+
+//+------------------------------------------------------------------+
+//| Check if SL is valid for trailing modification                     |
+//+------------------------------------------------------------------+
+bool IsValidTrailingStop(ENUM_POSITION_TYPE position_type, double new_sl)
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int stop_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   int freeze_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double min_distance = MathMax(stop_level, freeze_level) * _Point;
+
+   if(bid <= 0 || ask <= 0)
+      return false;
+
+   if(position_type == POSITION_TYPE_BUY)
+      return (new_sl < bid - min_distance);
+
+   return (new_sl > ask + min_distance);
+}
+
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   if(!ValidateInputs())
+      return(INIT_PARAMETERS_INCORRECT);
+
    // Initialize
    g_range_calculated = false;
    g_orders_placed = false;
@@ -356,10 +562,11 @@ void CalculateDailyRange()
    g_low_price = 99999999;
    
    MqlRates rates[];
-   int bars_copied = CopyRates(_Symbol, PERIOD_M1, g_range_start_time, g_range_end_time, rates);
+   datetime range_last_bar_time = g_range_end_time - 1;
+   int bars_copied = CopyRates(_Symbol, PERIOD_M1, g_range_start_time, range_last_bar_time, rates);
    if(bars_copied <= 0)
    {
-      Print("No M1 bars found for range window: ", TimeToString(g_range_start_time), " - ", TimeToString(g_range_end_time));
+      Print("No M1 bars found for range window: ", TimeToString(g_range_start_time), " - ", TimeToString(range_last_bar_time));
       return;
    }
 
@@ -412,13 +619,7 @@ double CalculateLotSize(double range_size)
       
       // Calculate lot size proportional to account balance
       double balance_ratio = account_balance / base_balance;
-      double lot_size = NormalizeDouble(balance_ratio * lot, 2);
-      
-      // Apply min/max limits
-      if(lot_size < min_lot)
-         lot_size = min_lot;
-      else if(lot_size > max_lot)
-         lot_size = max_lot;
+      double lot_size = NormalizeLotSize(balance_ratio * lot);
          
       Print("Autolot calculation - Balance: ", account_balance, ", Base balance: ", base_balance, 
             ", Balance ratio: ", balance_ratio, ", Base lot: ", lot, ", Calculated lot: ", lot_size);
@@ -427,7 +628,7 @@ double CalculateLotSize(double range_size)
    }
    else // Fixed lot size
    {
-      return lot; // Use lot as fixed lot value
+      return NormalizeLotSize(lot); // Use lot as fixed lot value
    }
 }
 
@@ -473,9 +674,14 @@ void PlacePendingOrders()
    
    
    g_lot_size = CalculateLotSize(range_size);
+   if(g_lot_size <= 0)
+   {
+      Print("Lot size calculation failed. No orders placed.");
+      g_orders_placed = true;
+      return;
+   }
 
-   if(StringCompare(breakout_mode, "one breakout per range") == 0 &&
-      (HasBuyPosition() || HasSellPosition()))
+   if(IsOneBreakoutMode() && (HasBuyPosition() || HasSellPosition()))
    {
       g_orders_placed = true;
       return;
@@ -505,6 +711,13 @@ void PlacePendingOrders()
       buy_tp = g_high_price + (range_size * take_profit / 100);
       sell_tp = g_low_price - (range_size * take_profit / 100);
    }
+
+   double buy_price = NormalizePrice(g_high_price);
+   double sell_price = NormalizePrice(g_low_price);
+   buy_sl = NormalizePrice(buy_sl);
+   buy_tp = NormalizePrice(buy_tp);
+   sell_sl = NormalizePrice(sell_sl);
+   sell_tp = NormalizePrice(sell_tp);
    
    // Place buy stop order at the high of the range
    trade.SetExpertMagicNumber(magic_number);
@@ -512,23 +725,32 @@ void PlacePendingOrders()
    bool buy_success = !need_buy;
    if(need_buy)
    {
-      buy_success = trade.BuyStop(
-         g_lot_size,
-         g_high_price,
-         _Symbol,
-         buy_sl,
-         buy_tp,
-         ORDER_TIME_DAY,
-         0,
-         "Range Breakout Buy"
-      );
+      bool buy_attempted = false;
+      if(ValidatePendingPrice(ORDER_TYPE_BUY_STOP, buy_price))
+      {
+         buy_attempted = true;
+         buy_success = trade.BuyStop(
+            g_lot_size,
+            buy_price,
+            _Symbol,
+            buy_sl,
+            buy_tp,
+            ORDER_TIME_DAY,
+            0,
+            "Range Breakout Buy"
+         );
+      }
+      else
+      {
+         buy_success = false;
+      }
 
       if(buy_success)
       {
          g_buy_ticket = trade.ResultOrder();
-         Print("Buy Stop order placed at ", g_high_price, " with lot size ", g_lot_size);
+         Print("Buy Stop order placed at ", buy_price, " with lot size ", g_lot_size);
       }
-      else
+      else if(buy_attempted)
       {
          Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
       }
@@ -538,23 +760,32 @@ void PlacePendingOrders()
    bool sell_success = !need_sell;
    if(need_sell)
    {
-      sell_success = trade.SellStop(
-         g_lot_size,
-         g_low_price,
-         _Symbol,
-         sell_sl,
-         sell_tp,
-         ORDER_TIME_DAY,
-         0,
-         "Range Breakout Sell"
-      );
+      bool sell_attempted = false;
+      if(ValidatePendingPrice(ORDER_TYPE_SELL_STOP, sell_price))
+      {
+         sell_attempted = true;
+         sell_success = trade.SellStop(
+            g_lot_size,
+            sell_price,
+            _Symbol,
+            sell_sl,
+            sell_tp,
+            ORDER_TIME_DAY,
+            0,
+            "Range Breakout Sell"
+         );
+      }
+      else
+      {
+         sell_success = false;
+      }
 
       if(sell_success)
       {
          g_sell_ticket = trade.ResultOrder();
-         Print("Sell Stop order placed at ", g_low_price, " with lot size ", g_lot_size);
+         Print("Sell Stop order placed at ", sell_price, " with lot size ", g_lot_size);
       }
-      else
+      else if(sell_attempted)
       {
          Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
       }
@@ -569,81 +800,21 @@ void PlacePendingOrders()
 void ManageOrders()
 {
    // If using "one breakout per range" mode, check if one order has been triggered
-   if(StringCompare(breakout_mode, "one breakout per range") == 0)
+   if(IsOneBreakoutMode())
    {
-      bool buy_triggered = false;
-      bool sell_triggered = false;
-      
-      // Get order information
-      if(g_buy_ticket > 0)
-      {
-         // Check if the order still exists and if it's a market order (was triggered)
-         if(OrderSelect(g_buy_ticket))
-         {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if(order_type == ORDER_TYPE_BUY) // Changed from pending to market = triggered
-               buy_triggered = true;
-         }
-         else
-         {
-            // Check if it became a position (was triggered and is still open)
-            if(PositionSelectByTicket(g_buy_ticket))
-            {
-               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                  buy_triggered = true;
-            }
-            else
-            {
-               g_buy_ticket = 0; // Order no longer exists
-            }
-         }
-      }
-      
-      // Check if sell stop order has been triggered
-      if(g_sell_ticket > 0)
-      {
-         // Check if the order still exists and if it's a market order (was triggered)
-         if(OrderSelect(g_sell_ticket))
-         {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if(order_type == ORDER_TYPE_SELL) // Changed from pending to market = triggered
-               sell_triggered = true;
-         }
-         else
-         {
-            // Check if it became a position (was triggered and is still open)
-            if(PositionSelectByTicket(g_sell_ticket))
-            {
-               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-                  sell_triggered = true;
-            }
-            else
-            {
-               g_sell_ticket = 0; // Order no longer exists
-            }
-         }
-      }
+      bool buy_triggered = HasBuyPosition();
+      bool sell_triggered = HasSellPosition();
       
       // If one order has been triggered, delete the other pending order
-      if(buy_triggered && g_sell_ticket > 0)
+      if(buy_triggered)
       {
-         if(OrderSelect(g_sell_ticket))
-         {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if(order_type == ORDER_TYPE_SELL_STOP)
-               trade.OrderDelete(g_sell_ticket);
-         }
-         g_sell_ticket = 0;
+         if(DeletePendingOrdersByType(ORDER_TYPE_SELL_STOP))
+            g_sell_ticket = 0;
       }
-      else if(sell_triggered && g_buy_ticket > 0)
+      else if(sell_triggered)
       {
-         if(OrderSelect(g_buy_ticket))
-         {
-            ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-            if(order_type == ORDER_TYPE_BUY_STOP)
-               trade.OrderDelete(g_buy_ticket);
-         }
-         g_buy_ticket = 0;
+         if(DeletePendingOrdersByType(ORDER_TYPE_BUY_STOP))
+            g_buy_ticket = 0;
       }
    }
 }
@@ -738,25 +909,33 @@ void ManageTrailingStop()
             if(position_type == POSITION_TYPE_BUY)
             {
                // For buy positions, trail below current price
-               new_sl = current_price - trailing_stop * _Point;
+               new_sl = NormalizePrice(current_price - trailing_stop * _Point);
                
                // Only modify if new SL is higher than current SL
-               if(position_sl == 0 || new_sl > position_sl)
+               if((position_sl == 0 || new_sl > position_sl) &&
+                  IsValidTrailingStop(position_type, new_sl))
                {
-                  trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
+                  if(trade.PositionModify(position_ticket, new_sl, position_tp))
+                     Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
+                  else
+                     Print("Failed to modify trailing stop for position #", position_ticket,
+                           ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
                }
             }
             else
             {
                // For sell positions, trail above current price
-               new_sl = current_price + trailing_stop * _Point;
+               new_sl = NormalizePrice(current_price + trailing_stop * _Point);
                
                // Only modify if new SL is lower than current SL or no SL is set
-               if(position_sl == 0 || new_sl < position_sl)
+               if((position_sl == 0 || new_sl < position_sl) &&
+                  IsValidTrailingStop(position_type, new_sl))
                {
-                  trade.PositionModify(position_ticket, new_sl, position_tp);
-                  Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
+                  if(trade.PositionModify(position_ticket, new_sl, position_tp))
+                     Print("Trailing stop for position #", position_ticket, " - New SL: ", new_sl);
+                  else
+                     Print("Failed to modify trailing stop for position #", position_ticket,
+                           ". Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
                }
             }
          }
