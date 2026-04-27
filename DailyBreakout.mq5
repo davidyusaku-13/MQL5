@@ -10,6 +10,12 @@
 #include <Trade\Trade.mqh>
 CTrade trade;
 
+enum ENUM_BREAKOUT_MODE
+{
+   BREAKOUT_ONE_PER_RANGE,  // One breakout per range
+   BREAKOUT_BOTH_DIRECTIONS // Both directions
+};
+
 // Input Parameters
 input int      magic_number = 12345;       // Magic Number
 input bool     autolot = false;            // Use autolot based on balance
@@ -22,7 +28,7 @@ input int      take_profit = 0;            // Take Profit in % of the range (0=o
 input int      range_start_time = 90;      // Range start time in minutes
 input int      range_duration = 270;       // Range duration in minutes
 input int      range_close_time = 1200;    // Range close time in minutes (-1=off)
-input string   breakout_mode = "one breakout per range"; // Breakout Mode
+input ENUM_BREAKOUT_MODE breakout_mode = BREAKOUT_ONE_PER_RANGE; // Breakout Mode
 input bool     range_on_monday = true;     // Range on Monday
 input bool     range_on_tuesday = true;    // Range on Tuesday
 input bool     range_on_wednesday = true;  // Range on Wednesday
@@ -196,7 +202,7 @@ bool HasActiveExposure()
 //+------------------------------------------------------------------+
 bool IsOneBreakoutMode()
 {
-   return (StringCompare(breakout_mode, "one breakout per range") == 0);
+   return (breakout_mode == BREAKOUT_ONE_PER_RANGE);
 }
 
 //+------------------------------------------------------------------+
