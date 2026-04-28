@@ -51,7 +51,10 @@ ulong g_buy_ticket = 0;
 ulong g_sell_ticket = 0;
 double g_lot_size = 0;
 datetime g_range_start_time = 0;
+datetime g_last_breakout_bar_time = 0;
 datetime g_current_day = 0;
+datetime g_test_start_time = 0;
+datetime g_test_end_time = 0;
 string g_start_line_name = "Range_Start_Line";
 string g_end_line_name = "Range_End_Line";
 string g_close_line_name = "Range_Close_Line";
@@ -317,39 +320,6 @@ bool ValidateInputs()
 }
 
 //+------------------------------------------------------------------+
-//| Validate pending order price against current price and stop level  |
-//+------------------------------------------------------------------+
-bool ValidatePendingPrice(ENUM_ORDER_TYPE order_type, double price)
-{
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   int stop_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double min_distance = stop_level * _Point;
-
-   if(bid <= 0 || ask <= 0)
-   {
-      Print("Invalid Bid/Ask. Bid: ", bid, ", Ask: ", ask);
-      return false;
-   }
-
-   if(order_type == ORDER_TYPE_BUY_STOP && price <= ask + min_distance)
-   {
-      Print("Buy Stop price too close or already passed. Price: ", price,
-            ", Ask: ", ask, ", Min distance points: ", stop_level);
-      return false;
-   }
-
-   if(order_type == ORDER_TYPE_SELL_STOP && price >= bid - min_distance)
-   {
-      Print("Sell Stop price too close or already passed. Price: ", price,
-            ", Bid: ", bid, ", Min distance points: ", stop_level);
-      return false;
-   }
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
 //| Delete pending orders by type                                      |
 //+------------------------------------------------------------------+
 bool DeletePendingOrdersByType(ENUM_ORDER_TYPE order_type)
@@ -413,6 +383,10 @@ int OnInit()
    g_range_calculated = false;
    g_orders_placed = false;
    g_lines_drawn = false;
+   g_last_breakout_bar_time = 0;
+   g_lot_size = 0;
+   g_test_start_time = 0;
+   g_test_end_time = 0;
    g_trailing_points = trailing_stop;
    
    // Set current day
@@ -446,13 +420,56 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
+//| Custom optimization criterion                                     |
+//+------------------------------------------------------------------+
+double OnTester()
+{
+   if(g_test_start_time <= 0 || g_test_end_time <= g_test_start_time)
+      return 0.0;
+
+   double trades = TesterStatistics(STAT_TRADES);
+   if(trades <= 0)
+      return 0.0;
+
+   double years = (double)(g_test_end_time - g_test_start_time) / 31557600.0;
+   if(years <= 0)
+      return 0.0;
+
+   double equity_dd_percent = TesterStatistics(STAT_EQUITYDD_PERCENT);
+   double initial_deposit = TesterStatistics(STAT_INITIAL_DEPOSIT);
+   double final_balance = initial_deposit + TesterStatistics(STAT_PROFIT);
+   double trades_per_year = trades / years;
+
+   if(initial_deposit <= 0 || final_balance <= 0)
+      return 0.0;
+
+   double cagr = (MathPow(final_balance / initial_deposit, 1.0 / years) - 1.0) * 100.0;
+
+   if(trades_per_year < 12.0)
+      return 0.0;
+
+   if(equity_dd_percent >= 30.0)
+      return 0.0;
+
+   if(cagr < 65.0)
+      return 0.0;
+
+   return TesterStatistics(STAT_COMPLEX_CRITERION);
+}
+
+//+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   datetime current_time = TimeCurrent();
+   if(g_test_start_time <= 0)
+      g_test_start_time = current_time;
+   g_test_end_time = current_time;
+
    // Check if day has changed
    MqlDateTime dt;
-   TimeCurrent(dt);
+   TimeToStruct(current_time, dt);
    dt.hour = 0;
    dt.min = 0;
    dt.sec = 0;
@@ -464,6 +481,8 @@ void OnTick()
       g_range_calculated = false;
       g_orders_placed = false;
       g_lines_drawn = false;
+      g_last_breakout_bar_time = 0;
+      g_lot_size = 0;
       g_current_day = today;
       DeleteAllLines();
    }
@@ -486,10 +505,10 @@ void OnTick()
       g_lines_drawn = true;
    }
    
-   // Check if we should place orders
+   // Check closed M1 bars for OHLC breakout signals
    if(!g_orders_placed && TimeCurrent() >= g_range_end_time)
    {
-      PlacePendingOrders();
+      ProcessBreakoutBars();
    }
    
    // Apply trailing stop to open positions if enabled
@@ -639,9 +658,115 @@ double CalculateLotSize(double range_size)
 }
 
 //+------------------------------------------------------------------+
-//| Place pending orders based on the calculated range               |
+//| Calculate SL/TP from current market price                         |
 //+------------------------------------------------------------------+
-void PlacePendingOrders()
+bool CalculateMarketStops(ENUM_POSITION_TYPE position_type, double range_size, double &sl, double &tp)
+{
+   sl = 0;
+   tp = 0;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int stop_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double min_distance = stop_level * _Point;
+
+   if(bid <= 0 || ask <= 0)
+   {
+      Print("Invalid Bid/Ask. Bid: ", bid, ", Ask: ", ask);
+      return false;
+   }
+
+   double entry_price = (position_type == POSITION_TYPE_BUY) ? ask : bid;
+   double sl_distance = range_size * stop_loss / 100;
+   double tp_distance = range_size * take_profit / 100;
+
+   if(position_type == POSITION_TYPE_BUY)
+   {
+      if(stop_loss > 0)
+      {
+         sl = NormalizePrice(entry_price - sl_distance);
+         if(sl >= bid - min_distance)
+         {
+            Print("Buy SL too close to market. SL: ", sl, ", Bid: ", bid, ", Min distance points: ", stop_level);
+            return false;
+         }
+      }
+
+      if(take_profit > 0)
+      {
+         tp = NormalizePrice(entry_price + tp_distance);
+         if(tp <= bid + min_distance)
+         {
+            Print("Buy TP too close to market. TP: ", tp, ", Bid: ", bid, ", Min distance points: ", stop_level);
+            return false;
+         }
+      }
+   }
+   else
+   {
+      if(stop_loss > 0)
+      {
+         sl = NormalizePrice(entry_price + sl_distance);
+         if(sl <= ask + min_distance)
+         {
+            Print("Sell SL too close to market. SL: ", sl, ", Ask: ", ask, ", Min distance points: ", stop_level);
+            return false;
+         }
+      }
+
+      if(take_profit > 0)
+      {
+         tp = NormalizePrice(entry_price - tp_distance);
+         if(tp >= ask - min_distance)
+         {
+            Print("Sell TP too close to market. TP: ", tp, ", Ask: ", ask, ", Min distance points: ", stop_level);
+            return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Open a market trade from a closed-bar breakout signal             |
+//+------------------------------------------------------------------+
+bool OpenBreakoutTrade(ENUM_POSITION_TYPE position_type, datetime signal_time)
+{
+   double range_size = g_high_price - g_low_price;
+   double sl = 0;
+   double tp = 0;
+
+   if(!CalculateMarketStops(position_type, range_size, sl, tp))
+      return false;
+
+   trade.SetExpertMagicNumber(magic_number);
+
+   bool success = false;
+   if(position_type == POSITION_TYPE_BUY)
+   {
+      success = trade.Buy(g_lot_size, _Symbol, 0, sl, tp, "Range Breakout Buy");
+      if(success)
+         Print("Buy opened from OHLC breakout bar ", TimeToString(signal_time), " with lot size ", g_lot_size);
+      else
+         Print("Failed to open Buy from OHLC breakout. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+   }
+   else
+   {
+      success = trade.Sell(g_lot_size, _Symbol, 0, sl, tp, "Range Breakout Sell");
+      if(success)
+         Print("Sell opened from OHLC breakout bar ", TimeToString(signal_time), " with lot size ", g_lot_size);
+      else
+         Print("Failed to open Sell from OHLC breakout. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+   }
+
+   return success;
+}
+
+//+------------------------------------------------------------------+
+//| Process closed M1 bars for OHLC breakout signals                  |
+//+------------------------------------------------------------------+
+void ProcessBreakoutBars()
 {
    if(g_high_price <= 0 || g_low_price >= 99999999)
       return;
@@ -654,15 +779,7 @@ void PlacePendingOrders()
       
    double range_size = g_high_price - g_low_price;
    double range_points = range_size / _Point;
-   
-   Print("=== Daily Range Details ===");
-   Print("Date: ", TimeToString(TimeCurrent()));
-   Print("Range High: ", g_high_price);
-   Print("Range Low: ", g_low_price);
-   Print("Range Size: ", range_points, " points");
-   Print("=========================");
-   
-      
+
    // Check if range size is within acceptable limits
    if(max_range_size > 0 && range_points > max_range_size)
    {
@@ -679,7 +796,18 @@ void PlacePendingOrders()
    }
    
    
-   g_lot_size = CalculateLotSize(range_size);
+   if(g_lot_size <= 0)
+   {
+      Print("=== Daily Range Details ===");
+      Print("Date: ", TimeToString(TimeCurrent()));
+      Print("Range High: ", g_high_price);
+      Print("Range Low: ", g_low_price);
+      Print("Range Size: ", range_points, " points");
+      Print("=========================");
+
+      g_lot_size = CalculateLotSize(range_size);
+   }
+
    if(g_lot_size <= 0)
    {
       Print("Lot size calculation failed. No orders placed.");
@@ -693,111 +821,87 @@ void PlacePendingOrders()
       return;
    }
 
-   bool need_buy = !HasBuyExposure();
-   bool need_sell = !HasSellExposure();
-
-   if(!need_buy && !need_sell)
-   {
-      g_orders_placed = true;
+   MqlRates latest_closed_bar[];
+   ArraySetAsSeries(latest_closed_bar, false);
+   if(CopyRates(_Symbol, PERIOD_M1, 1, 1, latest_closed_bar) <= 0)
       return;
-   }
-   
-   // Calculate SL and TP
-   double buy_sl = 0, buy_tp = 0, sell_sl = 0, sell_tp = 0;
-   
-   if(stop_loss > 0)
-   {
-      // Calculate SL based on range percentage
-      buy_sl = g_high_price - (range_size * stop_loss / 100);
-      sell_sl = g_low_price + (range_size * stop_loss / 100);
-   }
-   
-   if(take_profit > 0)
-   {
-      buy_tp = g_high_price + (range_size * take_profit / 100);
-      sell_tp = g_low_price - (range_size * take_profit / 100);
-   }
 
-   double buy_price = NormalizePrice(g_high_price);
-   double sell_price = NormalizePrice(g_low_price);
-   buy_sl = NormalizePrice(buy_sl);
-   buy_tp = NormalizePrice(buy_tp);
-   sell_sl = NormalizePrice(sell_sl);
-   sell_tp = NormalizePrice(sell_tp);
-   
-   // Place buy stop order at the high of the range
-   trade.SetExpertMagicNumber(magic_number);
-   
-   bool buy_success = !need_buy;
-   if(need_buy)
+   datetime latest_closed_time = latest_closed_bar[0].time;
+   if(latest_closed_time < g_range_end_time)
+      return;
+
+   datetime from_time = (g_last_breakout_bar_time > 0) ? g_last_breakout_bar_time + 60 : g_range_end_time;
+   if(from_time > latest_closed_time)
+      return;
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, false);
+   int bars_copied = CopyRates(_Symbol, PERIOD_M1, from_time, latest_closed_time, rates);
+   if(bars_copied <= 0)
+      return;
+
+   for(int i = 0; i < bars_copied; i++)
    {
-      bool buy_attempted = false;
-      if(ValidatePendingPrice(ORDER_TYPE_BUY_STOP, buy_price))
+      if(rates[i].time < g_range_end_time || rates[i].time <= g_last_breakout_bar_time)
+         continue;
+
+      bool buy_breakout = (rates[i].high >= g_high_price);
+      bool sell_breakout = (rates[i].low <= g_low_price);
+
+      if(!buy_breakout && !sell_breakout)
       {
-         buy_attempted = true;
-         buy_success = trade.BuyStop(
-            g_lot_size,
-            buy_price,
-            _Symbol,
-            buy_sl,
-            buy_tp,
-            ORDER_TIME_DAY,
-            0,
-            "Range Breakout Buy"
-         );
-      }
-      else
-      {
-         buy_success = false;
+         g_last_breakout_bar_time = rates[i].time;
+         continue;
       }
 
-      if(buy_success)
+      if(IsOneBreakoutMode() && buy_breakout && sell_breakout)
       {
-         g_buy_ticket = trade.ResultOrder();
-         Print("Buy Stop order placed at ", buy_price, " with lot size ", g_lot_size);
-      }
-      else if(buy_attempted)
-      {
-         Print("Failed to place Buy Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
-      }
-   }
-   
-   // Place sell stop order at the low of the range
-   bool sell_success = !need_sell;
-   if(need_sell)
-   {
-      bool sell_attempted = false;
-      if(ValidatePendingPrice(ORDER_TYPE_SELL_STOP, sell_price))
-      {
-         sell_attempted = true;
-         sell_success = trade.SellStop(
-            g_lot_size,
-            sell_price,
-            _Symbol,
-            sell_sl,
-            sell_tp,
-            ORDER_TIME_DAY,
-            0,
-            "Range Breakout Sell"
-         );
-      }
-      else
-      {
-         sell_success = false;
+         Print("Skipping ambiguous OHLC breakout bar ", TimeToString(rates[i].time),
+               ": both range high and low touched in same M1 candle.");
+         g_last_breakout_bar_time = rates[i].time;
+         continue;
       }
 
-      if(sell_success)
+      bool failed_needed_trade = false;
+
+      if(buy_breakout)
       {
-         g_sell_ticket = trade.ResultOrder();
-         Print("Sell Stop order placed at ", sell_price, " with lot size ", g_lot_size);
+         if(!HasBuyExposure())
+         {
+            bool buy_opened = OpenBreakoutTrade(POSITION_TYPE_BUY, rates[i].time);
+            failed_needed_trade = (!buy_opened) || failed_needed_trade;
+            if(IsOneBreakoutMode() && buy_opened)
+            {
+               g_orders_placed = true;
+               g_last_breakout_bar_time = rates[i].time;
+               return;
+            }
+         }
       }
-      else if(sell_attempted)
+
+      if(sell_breakout)
       {
-         Print("Failed to place Sell Stop order. Error: ", trade.ResultRetcode(), ", ", trade.ResultRetcodeDescription());
+         if(!HasSellExposure())
+         {
+            bool sell_opened = OpenBreakoutTrade(POSITION_TYPE_SELL, rates[i].time);
+            failed_needed_trade = (!sell_opened) || failed_needed_trade;
+            if(IsOneBreakoutMode() && sell_opened)
+            {
+               g_orders_placed = true;
+               g_last_breakout_bar_time = rates[i].time;
+               return;
+            }
+         }
       }
+
+      if(failed_needed_trade)
+         return;
+
+      g_last_breakout_bar_time = rates[i].time;
+
+      if(!IsOneBreakoutMode() && HasBuyExposure() && HasSellExposure())
+         g_orders_placed = true;
    }
-   
-   g_orders_placed = buy_success && sell_success;
 }
 
 //+------------------------------------------------------------------+
