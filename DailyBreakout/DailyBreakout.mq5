@@ -366,10 +366,6 @@ double OnTester()
    if(equity_dd_percent >= 30.0)
       return 0.0;
 
-   double expected_payoff = TesterStatistics(STAT_EXPECTED_PAYOFF);
-   if(expected_payoff <= 50.0)
-      return 0.0;
-
    double trades = TesterStatistics(STAT_TRADES);
    if(trades <= 0 || g_test_start_time <= 0 || g_test_end_time <= g_test_start_time)
       return 0.0;
@@ -382,7 +378,16 @@ double OnTester()
    if(trades_per_year < 12.0)
       return 0.0;
 
-   return TesterStatistics(STAT_COMPLEX_CRITERION);
+   double initial_deposit = TesterStatistics(STAT_INITIAL_DEPOSIT);
+   double final_balance = initial_deposit + TesterStatistics(STAT_PROFIT);
+   if(initial_deposit <= 0 || final_balance <= 0)
+      return 0.0;
+
+   double cagr_percent = (MathPow(final_balance / initial_deposit, 1.0 / years) - 1.0) * 100.0;
+   if(cagr_percent < 25.0)
+      return 0.0;
+
+   return TesterStatistics(STAT_PROFIT);
 }
 
 //+------------------------------------------------------------------+
